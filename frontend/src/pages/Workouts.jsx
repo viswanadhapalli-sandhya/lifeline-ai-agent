@@ -1,10 +1,12 @@
 import { useEffect, useState } from "react";
 import TopNav from "../components/TopNav";
 import { auth, db } from "../services/firebase";
-import { collection, limit, onSnapshot, orderBy, query } from "firebase/firestore";
+import { collection, doc, limit, onSnapshot, orderBy, query } from "firebase/firestore";
 
 export default function Workouts() {
   const [plan, setPlan] = useState(null);
+  const [planMeta, setPlanMeta] = useState(null);
+  const [progressSummary, setProgressSummary] = useState(null);
   const [loading, setLoading] = useState(true);
   let risk = null;
 
@@ -23,6 +25,7 @@ export default function Workouts() {
 
     if (!user) {
       setPlan(cached);
+      setPlanMeta(null);
       setLoading(false);
       return;
     }
@@ -33,30 +36,63 @@ export default function Workouts() {
       limit(1)
     );
 
+    const progressRef = doc(db, "users", user.uid, "progressStats", "summary");
+    const unsubProgress = onSnapshot(
+      progressRef,
+      (snap) => {
+        if (!snap.exists()) {
+          setProgressSummary(null);
+          return;
+        }
+        setProgressSummary(snap.data() || null);
+      },
+      (e) => {
+        console.error(e);
+        setProgressSummary(null);
+      }
+    );
+
     const unsub = onSnapshot(
       q,
       (snap) => {
         if (!snap.empty) {
-          const latest = snap.docs[0].data();
+          const latestDoc = snap.docs[0];
+          const latest = latestDoc.data();
           const resolved = { plan: latest.plan || [] };
           setPlan(resolved);
+          const createdAt = latest.createdAt?.toDate ? latest.createdAt.toDate() : null;
+          setPlanMeta({
+            id: latestDoc.id,
+            createdAt,
+          });
           try {
             localStorage.setItem("workoutPlan", JSON.stringify(resolved));
           } catch {}
         } else {
           setPlan(cached);
+          setPlanMeta(null);
         }
         setLoading(false);
       },
       (e) => {
         console.error(e);
         setPlan(cached);
+        setPlanMeta(null);
         setLoading(false);
       }
     );
 
-    return () => unsub();
+    return () => {
+      unsub();
+      unsubProgress();
+    };
   }, []);
+
+  const totalWorkoutDays = Number(progressSummary?.total_workout_days || 0);
+  const completedDaysInCurrentCycle = totalWorkoutDays % 7;
+  const visiblePlanDays = Array.isArray(plan?.plan)
+    ? plan.plan.slice(completedDaysInCurrentCycle)
+    : [];
 
   if (loading) {
     return (
@@ -102,11 +138,31 @@ export default function Workouts() {
             : "AI-generated workout plan"}
         </p>
 
+        {planMeta?.id && (
+          <div className="mt-3 inline-flex items-center gap-2 rounded-md border border-white/15 bg-white/5 px-3 py-1 text-xs text-white/80">
+            <span className="font-semibold">Plan Version</span>
+            <span>#{planMeta.id.slice(0, 8)}</span>
+            <span>•</span>
+            <span>
+              {planMeta.createdAt
+                ? `Updated ${planMeta.createdAt.toLocaleString()}`
+                : "Updated just now"}
+            </span>
+          </div>
+        )}
+
+        {totalWorkoutDays > 0 && (
+          <div className="mt-3 text-xs text-green-300/90">
+            Completed in current cycle: {completedDaysInCurrentCycle} day(s)
+          </div>
+        )}
+
         {/* 🔥 AI Workout Plan */}
         <div className="mt-6 grid grid-cols-1 md:grid-cols-2 gap-6">
-          {plan.plan.map((day, idx) => (
+          {visiblePlanDays.length > 0 ? (
+            visiblePlanDays.map((day, idx) => (
             <Card
-              key={idx}
+              key={`${day.day || "day"}-${idx}`}
               title={day.day}
               subtitle="AI Personalized Workout"
             >
@@ -153,7 +209,15 @@ export default function Workouts() {
                 </div>
               )}
             </Card>
-          ))}
+            ))
+          ) : (
+            <div className="md:col-span-2 rounded-2xl p-6 bg-white/5 border border-white/10">
+              <div className="text-lg font-semibold">No pending workout days in this cycle</div>
+              <div className="text-white/70 text-sm mt-2">
+                Great consistency. Ask Coach to generate or refresh your next cycle plan.
+              </div>
+            </div>
+          )}
         </div>
       </div>
     </div>

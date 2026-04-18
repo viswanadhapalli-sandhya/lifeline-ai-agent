@@ -1,6 +1,6 @@
 import json
 import re
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any, Dict, List
 
@@ -16,6 +16,20 @@ from app.services.workout_service import generate_workout_plan
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _to_json_safe(value: Any) -> Any:
+    # Firestore SERVER_TIMESTAMP sentinels are not JSON-serializable.
+    if type(value).__name__ == "Sentinel":
+        return None
+
+    if isinstance(value, dict):
+        return {k: _to_json_safe(v) for k, v in value.items()}
+
+    if isinstance(value, list):
+        return [_to_json_safe(v) for v in value]
+
+    return value
 
 
 def _today_key() -> str:
@@ -80,6 +94,31 @@ def _fetch_recent_daily_logs(user_id: str, days: int = 7) -> List[Dict[str, Any]
     return [doc.to_dict() or {} for doc in docs]
 
 
+def _fetch_all_daily_logs(user_id: str, max_entries: int = 1000) -> List[Dict[str, Any]]:
+    docs = (
+        db.collection("users")
+        .document(user_id)
+        .collection("dailyLogs")
+        .order_by("date", direction=firestore.Query.DESCENDING)
+        .limit(max_entries)
+        .get()
+    )
+    return [doc.to_dict() or {} for doc in docs]
+
+
+def _fetch_progress_summary(user_id: str) -> Dict[str, Any]:
+    snap = (
+        db.collection("users")
+        .document(user_id)
+        .collection("progressStats")
+        .document("summary")
+        .get()
+    )
+    if not snap.exists:
+        return {}
+    return snap.to_dict() or {}
+
+
 def _upsert_daily_log(user_id: str, updates: Dict[str, Any], date_key: str | None = None) -> None:
     day = date_key or _today_key()
     ref = db.collection("users").document(user_id).collection("dailyLogs").document(day)
@@ -89,6 +128,71 @@ def _upsert_daily_log(user_id: str, updates: Dict[str, Any], date_key: str | Non
         "updatedAt": firestore.SERVER_TIMESTAMP,
     }
     ref.set(updates, merge=True)
+
+
+def _fetch_daily_log(user_id: str, date_key: str | None = None) -> Dict[str, Any]:
+    day = date_key or _today_key()
+    snap = db.collection("users").document(user_id).collection("dailyLogs").document(day).get()
+    if not snap.exists:
+        return {}
+    return snap.to_dict() or {}
+
+
+def _refresh_progress_summary(user_id: str, logs: List[Dict[str, Any]] | None = None) -> Dict[str, Any]:
+    all_logs = logs if isinstance(logs, list) else _fetch_all_daily_logs(user_id)
+
+    workout_days = _count_workout_days(all_logs)
+    max_workout_day_number = 0
+    meal_days = _count_meal_logged_days(all_logs)
+    total_workout_minutes = 0
+    recent_workout_history: List[Dict[str, Any]] = []
+
+    for item in all_logs:
+        minutes = item.get("workout_minutes", 0)
+        if isinstance(minutes, (int, float)):
+            total_workout_minutes += max(0, int(minutes))
+
+        completed = bool(item.get("workout_completed", False))
+        day_worked = completed or (isinstance(minutes, (int, float)) and int(minutes) > 0)
+        date_key = item.get("date")
+        day_number = item.get("workout_day_number")
+        if isinstance(day_number, (int, float)) and int(day_number) > 0:
+            max_workout_day_number = max(max_workout_day_number, int(day_number))
+        if day_worked and isinstance(date_key, str):
+            recent_workout_history.append(
+                {
+                    "date": date_key,
+                    "workout_minutes": int(minutes) if isinstance(minutes, (int, float)) else 0,
+                    "workout_completed": completed,
+                    "workout_day_number": int(day_number) if isinstance(day_number, (int, float)) and int(day_number) > 0 else None,
+                }
+            )
+
+    # If user explicitly reports plan day number (e.g., day 2), trust that progression.
+    workout_days = max(workout_days, max_workout_day_number)
+
+    summary_to_store = {
+        "total_workout_days": workout_days,
+        "total_meal_log_days": meal_days,
+        "total_daily_logs": len(all_logs),
+        "total_workout_minutes": total_workout_minutes,
+        "recent_workout_history": recent_workout_history[:30],
+        "lastUpdatedAt": firestore.SERVER_TIMESTAMP,
+    }
+
+    (
+        db.collection("users")
+        .document(user_id)
+        .collection("progressStats")
+        .document("summary")
+        .set(summary_to_store, merge=True)
+    )
+
+    response_summary = {
+        **summary_to_store,
+        "lastUpdatedAt": _utc_now().isoformat(),
+    }
+    return _to_json_safe(response_summary)
 
 
 def _record_agent_event(user_id: str, payload: Dict[str, Any]) -> None:
@@ -296,6 +400,12 @@ def _extract_structured_logs(message: str) -> Dict[str, Any]:
 
     extracted: Dict[str, Any] = {}
 
+    if _is_travel_resume_message(text):
+        extracted["travel_window_closed"] = True
+        extracted["travel_disruption"] = False
+        extracted["travel_days"] = 0
+        extracted["compensation_request"] = False
+
     weight_match = re.search(r"(\d+(?:\.\d+)?)\s?kg", lowered)
     if weight_match:
         extracted["weight_kg"] = float(weight_match.group(1))
@@ -306,6 +416,7 @@ def _extract_structured_logs(message: str) -> Dict[str, Any]:
 
     if any(token in lowered for token in ["ate", "breakfast", "lunch", "dinner", "snack"]):
         extracted["meal_text"] = text
+        extracted["meal_logged"] = True
 
     if "skipped workout" in lowered or "missed workout" in lowered:
         extracted["workout_minutes"] = 0
@@ -322,6 +433,34 @@ def _extract_structured_logs(message: str) -> Dict[str, Any]:
     ):
         extracted["workout_completed"] = True
 
+    # Handle phrases like "done with day 2", "completed day 3", "day 1 done".
+    completion_day_match = re.search(r"\b(?:done|completed|finished)\s+(?:with\s+)?day\s*(\d{1,2})\b", lowered)
+    if completion_day_match:
+        extracted["workout_completed"] = True
+        extracted["workout_day_number"] = int(completion_day_match.group(1))
+
+    completion_day_match_alt = re.search(r"\bday\s*(\d{1,2})\s*(?:done|completed|finished)\b", lowered)
+    if completion_day_match_alt:
+        extracted["workout_completed"] = True
+        extracted["workout_day_number"] = int(completion_day_match_alt.group(1))
+
+    completion_day_match_over = re.search(r"\bday\s*(\d{1,2})\s*(?:is\s+)?over\b", lowered)
+    if completion_day_match_over:
+        extracted["workout_completed"] = True
+        extracted["workout_day_number"] = int(completion_day_match_over.group(1))
+
+    if (
+        not bool(extracted.get("travel_window_closed", False))
+        and any(token in lowered for token in ["travel", "travelling", "traveling", "out of town", "trip"])
+    ):
+        extracted["travel_disruption"] = True
+        travel_days = _extract_travel_days(text)
+        if travel_days > 0:
+            extracted["travel_days"] = travel_days
+
+    if any(token in lowered for token in ["compensate", "make up", "make-up", "restructure", "adjust plan"]):
+        extracted["compensation_request"] = True
+
     positive_follow_tokens = [
         "followed well",
         "followed the plan",
@@ -337,9 +476,15 @@ def _extract_structured_logs(message: str) -> Dict[str, Any]:
         "finished todays workout",
         "completed today's work",
         "completed todays work",
+        "done with today",
+        "finished it",
+        "finished today",
     ]
     if any(token in lowered for token in positive_follow_tokens):
         extracted["adherence_status"] = "good"
+        # Positive adherence without explicit minutes should still count as completed day.
+        extracted["workout_completed"] = True
+        extracted["meal_logged"] = True
 
     negative_follow_tokens = [
         "couldn't follow",
@@ -353,6 +498,295 @@ def _extract_structured_logs(message: str) -> Dict[str, Any]:
         extracted["adherence_status"] = "poor"
 
     return extracted
+
+
+def _extract_travel_days(message: str) -> int:
+    text = (message or "").lower()
+    if not text:
+        return 0
+
+    def _clamp_days(days: int) -> int:
+        return max(1, min(14, int(days)))
+
+    def _resolve_day_in_calendar(day_number: int, reference: date) -> date | None:
+        if day_number < 1 or day_number > 31:
+            return None
+
+        year = reference.year
+        month = reference.month
+
+        for month_offset in [0, 1, 2]:
+            target_month = month + month_offset
+            target_year = year + (target_month - 1) // 12
+            target_month = ((target_month - 1) % 12) + 1
+            try:
+                candidate = date(target_year, target_month, day_number)
+            except ValueError:
+                continue
+
+            if month_offset == 0 and candidate < reference:
+                continue
+            return candidate
+
+        return None
+
+    # Prefer explicit numeric mentions like "next 4 days".
+    match = re.search(r"(?:next|for|about|around)?\s*(\d{1,2})\s*(?:day|days)", text)
+    if match:
+        return _clamp_days(int(match.group(1)))
+
+    word_to_num = {
+        "one": 1,
+        "two": 2,
+        "three": 3,
+        "four": 4,
+        "five": 5,
+        "six": 6,
+        "seven": 7,
+    }
+    for word, value in word_to_num.items():
+        if f"{word} day" in text or f"{word} days" in text:
+            return value
+
+    if any(token in text for token in ["few days", "next few days"]):
+        return 3
+
+    today = _utc_now().date()
+
+    # Examples: "till Wednesday", "until next monday".
+    weekday_map = {
+        "monday": 0,
+        "tuesday": 1,
+        "wednesday": 2,
+        "thursday": 3,
+        "friday": 4,
+        "saturday": 5,
+        "sunday": 6,
+    }
+    weekday_match = re.search(
+        r"\b(?:till|until|through)(?:\s+next)?\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+        text,
+    )
+    if weekday_match:
+        target_weekday = weekday_map[weekday_match.group(1)]
+        delta = (target_weekday - today.weekday()) % 7
+        if delta == 0:
+            delta = 7
+        return _clamp_days(delta)
+
+    # Examples: "from 20th to 24th", "20 to 24".
+    range_match = re.search(
+        r"\b(?:from\s+)?(\d{1,2})(?:st|nd|rd|th)?\s*(?:to|\-|until|till)\s*(\d{1,2})(?:st|nd|rd|th)?\b",
+        text,
+    )
+    if range_match:
+        start_day = int(range_match.group(1))
+        end_day = int(range_match.group(2))
+        start_date = _resolve_day_in_calendar(start_day, today)
+        if start_date:
+            end_date = _resolve_day_in_calendar(end_day, start_date)
+            if end_date:
+                span = (end_date - start_date).days + 1
+                return _clamp_days(span)
+
+    # Example: "until 24th".
+    until_day_match = re.search(r"\b(?:till|until)\s+(\d{1,2})(?:st|nd|rd|th)?\b", text)
+    if until_day_match:
+        end_day = int(until_day_match.group(1))
+        end_date = _resolve_day_in_calendar(end_day, today)
+        if end_date:
+            span = (end_date - today).days + 1
+            return _clamp_days(span)
+
+    return 0
+
+
+def _travel_workout_day(day_number: int) -> Dict[str, Any]:
+    return {
+        "day": f"Day {day_number}",
+        "warmup": ["Travel day: no structured workout"],
+        "exercises": [],
+        "cooldown": ["5 min gentle breathing before sleep"],
+        "tip": "Focus on hydration and sleep during travel.",
+    }
+
+
+def _ensure_workout_day_shape(day: Dict[str, Any], day_number: int) -> Dict[str, Any]:
+    safe = day if isinstance(day, dict) else {}
+    return {
+        "day": str(safe.get("day") or f"Day {day_number}"),
+        "warmup": safe.get("warmup") if isinstance(safe.get("warmup"), list) else ["5 min walk"],
+        "exercises": safe.get("exercises") if isinstance(safe.get("exercises"), list) else [],
+        "cooldown": safe.get("cooldown") if isinstance(safe.get("cooldown"), list) else ["Light stretching"],
+        "tip": str(safe.get("tip") or "Consistency matters more than intensity."),
+    }
+
+
+def _ensure_nutrition_day_shape(day: Dict[str, Any], day_number: int) -> Dict[str, Any]:
+    safe = day if isinstance(day, dict) else {}
+    return {
+        "day": str(safe.get("day") or f"Day {day_number}"),
+        "breakfast": safe.get("breakfast") if isinstance(safe.get("breakfast"), list) else ["Poha + curd"],
+        "lunch": safe.get("lunch") if isinstance(safe.get("lunch"), list) else ["Dal, rice, sabzi"],
+        "snacks": safe.get("snacks") if isinstance(safe.get("snacks"), list) else ["Fruit + nuts"],
+        "dinner": safe.get("dinner") if isinstance(safe.get("dinner"), list) else ["Roti + paneer/chana + salad"],
+        "tip": str(safe.get("tip") or "Keep portions moderate and hydrate well."),
+    }
+
+
+def _build_travel_compensation_workout_plan(base_plan: List[Dict[str, Any]], travel_days: int) -> Dict[str, Any]:
+    if not isinstance(base_plan, list):
+        base_plan = []
+
+    normalized = [_ensure_workout_day_shape(day, idx + 1) for idx, day in enumerate(base_plan[:7])]
+    while len(normalized) < 7:
+        normalized.append(_ensure_workout_day_shape({}, len(normalized) + 1))
+
+    td = max(1, min(6, travel_days))
+    for idx in range(td):
+        normalized[idx] = _travel_workout_day(idx + 1)
+
+    # Gradual compensation after travel: avoid sudden spike.
+    ramp_day_indices = [td, td + 1, td + 2]
+    ramp_minutes = [20, 30, 40]
+    for offset, day_idx in enumerate(ramp_day_indices):
+        if day_idx >= len(normalized):
+            break
+        day = _ensure_workout_day_shape(normalized[day_idx], day_idx + 1)
+        day["tip"] = (
+            f"Compensation ramp day {offset + 1}: target about {ramp_minutes[offset]} minutes, keep form strict, no overtraining."
+        )
+        normalized[day_idx] = day
+
+    return {"plan": normalized}
+
+
+def _build_travel_compensation_nutrition_plan(base_plan: List[Dict[str, Any]], travel_days: int) -> Dict[str, Any]:
+    if not isinstance(base_plan, list):
+        base_plan = []
+
+    normalized = [_ensure_nutrition_day_shape(day, idx + 1) for idx, day in enumerate(base_plan[:7])]
+    while len(normalized) < 7:
+        normalized.append(_ensure_nutrition_day_shape({}, len(normalized) + 1))
+
+    td = max(1, min(6, travel_days))
+
+    for idx in range(td):
+        day_number = idx + 1
+        normalized[idx] = {
+            "day": f"Day {day_number}",
+            "breakfast": ["Portable protein option (curd/eggs/protein milk)", "One fruit"],
+            "lunch": ["Simple thali: dal + sabzi + controlled rice/roti"],
+            "snacks": ["Roasted chana / nuts", "Buttermilk or water"],
+            "dinner": ["Lean protein + vegetables", "Keep dinner lighter than lunch"],
+            "tip": "Travel phase: prioritize protein, hydration, and portion control.",
+        }
+
+    for day_idx in [td, td + 1, td + 2]:
+        if day_idx >= len(normalized):
+            break
+        normalized[day_idx]["tip"] = "Compensation phase: maintain high protein and avoid sugar-heavy snacks."
+
+    return {"plan": normalized}
+
+
+def _normalize_workout_plan(plan: Any) -> List[Dict[str, Any]]:
+    normalized = []
+    if not isinstance(plan, list):
+        plan = []
+
+    for idx, day in enumerate(plan[:7], start=1):
+        normalized.append(_ensure_workout_day_shape(day, idx))
+
+    while len(normalized) < 7:
+        normalized.append(_ensure_workout_day_shape({}, len(normalized) + 1))
+
+    return normalized
+
+
+def _normalize_nutrition_plan(plan: Any) -> List[Dict[str, Any]]:
+    normalized = []
+    if not isinstance(plan, list):
+        plan = []
+
+    for idx, day in enumerate(plan[:7], start=1):
+        normalized.append(_ensure_nutrition_day_shape(day, idx))
+
+    while len(normalized) < 7:
+        normalized.append(_ensure_nutrition_day_shape({}, len(normalized) + 1))
+
+    return normalized
+
+
+def _adaptive_travel_compensation_with_ai(
+    goal: str,
+    message: str,
+    travel_days: int,
+    base_workout_plan: List[Dict[str, Any]],
+    base_nutrition_plan: List[Dict[str, Any]],
+) -> Dict[str, Any] | None:
+    td = max(1, min(6, int(travel_days)))
+
+    payload = {
+        "goal": goal,
+        "message": message,
+        "travel_days": td,
+        "base_workout": _normalize_workout_plan(base_workout_plan),
+        "base_nutrition": _normalize_nutrition_plan(base_nutrition_plan),
+    }
+
+    prompt = f"""
+You are a fitness and nutrition planner.
+User cannot do workouts for exactly {td} days due to travel.
+Restructure plans dynamically, not generic.
+
+Rules:
+- Keep a 7-day output.
+- Days 1..{td}: no structured workouts.
+- After day {td}, create compensation progression based on remaining days.
+- Update relevant sections in-place: warmup/exercises/cooldown/tip and breakfast/lunch/snacks/dinner/tip.
+- Nutrition during travel should reduce damage (hydration, protein priority, portion control).
+- Compensation should be safe, not extreme.
+
+Input JSON:
+{json.dumps(payload, default=str)}
+
+Return STRICT JSON only:
+{{
+  "workout": {{ "plan": [{{"day":"Day 1","warmup":[],"exercises":[],"cooldown":[],"tip":""}}] }},
+  "nutrition": {{ "plan": [{{"day":"Day 1","breakfast":[],"lunch":[],"snacks":[],"dinner":[],"tip":""}}] }}
+}}
+"""
+
+    try:
+        raw = generate_ai_response(prompt)
+        parsed = _safe_json_loads(raw)
+        workout = _normalize_workout_plan((parsed.get("workout") or {}).get("plan"))
+        nutrition = _normalize_nutrition_plan((parsed.get("nutrition") or {}).get("plan"))
+
+        for idx in range(td):
+            # Enforce no structured workouts during declared travel window.
+            workout[idx]["exercises"] = []
+            workout[idx]["warmup"] = ["Travel day: mobility optional, no formal workout"]
+            workout[idx]["cooldown"] = ["5 min deep breathing before sleep"]
+
+            # Enforce travel-practical meals for the same window.
+            day_number = idx + 1
+            nutrition[idx] = {
+                "day": f"Day {day_number}",
+                "breakfast": ["Portable protein option (curd/eggs/protein milk)", "One fruit"],
+                "lunch": ["Simple thali: dal + sabzi + controlled rice/roti"],
+                "snacks": ["Roasted chana / nuts", "Buttermilk or water"],
+                "dinner": ["Lean protein + vegetables", "Keep dinner lighter than lunch"],
+                "tip": "Travel phase: prioritize hydration and protein; perfection is not required.",
+            }
+
+        return {
+            "workout": {"plan": workout},
+            "nutrition": {"plan": nutrition},
+        }
+    except Exception:
+        return None
 
 
 def _extract_structured_logs_with_ai(message: str) -> Dict[str, Any]:
@@ -371,10 +805,13 @@ Return STRICT JSON only:
   "weight_kg": number or null,
   "workout_minutes": number or null,
     "workout_completed": boolean,
+        "workout_day_number": number or null,
     "missed_workout_items": ["..."],
   "meal_text": string or "",
+        "meal_logged": boolean,
     "adherence_status": "good" | "poor" | "neutral",
     "travel_disruption": boolean,
+    "travel_days": number or null,
     "compensation_request": boolean
 }}
 """
@@ -396,6 +833,10 @@ Return STRICT JSON only:
         if isinstance(workout_completed, bool):
             cleaned["workout_completed"] = workout_completed
 
+        workout_day_number = payload.get("workout_day_number")
+        if isinstance(workout_day_number, (int, float)) and int(workout_day_number) > 0:
+            cleaned["workout_day_number"] = int(workout_day_number)
+
         missed_workout_items = payload.get("missed_workout_items")
         if isinstance(missed_workout_items, list):
             cleaned["missed_workout_items"] = [str(x).strip() for x in missed_workout_items if str(x).strip()][:5]
@@ -404,13 +845,25 @@ Return STRICT JSON only:
         if isinstance(meal_text, str) and meal_text.strip():
             cleaned["meal_text"] = meal_text.strip()
 
+        meal_logged = payload.get("meal_logged")
+        if isinstance(meal_logged, bool):
+            cleaned["meal_logged"] = meal_logged
+
         adherence_status = payload.get("adherence_status")
         if adherence_status in {"good", "poor", "neutral"}:
             cleaned["adherence_status"] = adherence_status
+            if adherence_status == "good" and "workout_completed" not in cleaned:
+                cleaned["workout_completed"] = True
+            if adherence_status == "good" and "meal_logged" not in cleaned:
+                cleaned["meal_logged"] = True
 
         travel_disruption = payload.get("travel_disruption")
         if isinstance(travel_disruption, bool):
             cleaned["travel_disruption"] = travel_disruption
+
+        travel_days = payload.get("travel_days")
+        if isinstance(travel_days, (int, float)) and int(travel_days) > 0:
+            cleaned["travel_days"] = max(1, min(14, int(travel_days)))
 
         compensation_request = payload.get("compensation_request")
         if isinstance(compensation_request, bool):
@@ -520,6 +973,7 @@ def _llm_finalize_response(
     nudges: List[str],
     plan_updates: Dict[str, Any],
     current_plans: Dict[str, Any],
+    progress_summary: Dict[str, Any],
     weekly_reflection: Dict[str, Any],
     recent_logs: List[Dict[str, Any]],
     structured_logs: Dict[str, Any],
@@ -536,6 +990,7 @@ def _llm_finalize_response(
         "actions": actions,
         "nudges": nudges,
         "plan_update_keys": list(plan_updates.keys()),
+        "progress_summary": progress_summary,
         "workout_preview": workout_preview,
         "nutrition_preview": nutrition_preview,
         "weekly_reflection": weekly_reflection,
@@ -571,15 +1026,67 @@ Return STRICT JSON only:
 
     def _build_grounded_plan_text(header: str = "Here is your plan:") -> str:
         lines: List[str] = [header]
+        travel_days = int(decision.get("travel_days") or 0)
+        show_post_travel_preview = bool(user_intent.get("post_travel_query", False))
+        meal_on_track_workout_missed = bool(decision.get("meal_on_track_workout_missed", False))
+        completed_workout_days = int(progress_summary.get("total_workout_days", 0))
+        cycle_day_number = (completed_workout_days % 7) + 1
+        cycle_week_number = (completed_workout_days // 7) + 1
+        cycle_day_idx = cycle_day_number - 1
+        target_label = f"Week {cycle_week_number} Day {cycle_day_number}"
+
+        if meal_on_track_workout_missed:
+            lines.append(
+                "You followed nutrition but missed workout, so I adjusted tomorrow with a safe +10 minute workout compensation and recovery-aware meal guidance."
+            )
+
+        lines.append(f"Today Target: {target_label}")
+
+        if travel_days > 0:
+            lines.append(
+                f"Travel window (next {travel_days} day(s)): no structured workouts. Focus on sleep, hydration, and meal consistency."
+            )
+
+            travel_meal_day = (nutrition_source[0] if nutrition_source else {}) if isinstance(nutrition_source, list) else {}
+            if isinstance(travel_meal_day, dict):
+                breakfast = travel_meal_day.get("breakfast") if isinstance(travel_meal_day.get("breakfast"), list) else []
+                lunch = travel_meal_day.get("lunch") if isinstance(travel_meal_day.get("lunch"), list) else []
+                snacks = travel_meal_day.get("snacks") if isinstance(travel_meal_day.get("snacks"), list) else []
+                dinner = travel_meal_day.get("dinner") if isinstance(travel_meal_day.get("dinner"), list) else []
+                lines.append("Meals (Travel phase):")
+                if breakfast:
+                    lines.append(f"- Breakfast: {breakfast[0]}")
+                if lunch:
+                    lines.append(f"- Lunch: {lunch[0]}")
+                if snacks:
+                    lines.append(f"- Snacks: {snacks[0]}")
+                if dinner:
+                    lines.append(f"- Dinner: {dinner[0]}")
+
+            if not show_post_travel_preview:
+                if nudges:
+                    lines.append(f"Priority habit: {nudges[0]}")
+                lines.append("Send an evening check-in and I will adapt tomorrow's plan if needed.")
+                return "\n".join(lines)
 
         if workout_preview:
-            day = workout_preview[0] or {}
-            day_name = day.get("day", "Day 1")
+            day_idx = cycle_day_idx
+            if travel_days > 0 and len(workout_source) > travel_days:
+                day_idx = travel_days
+            if day_idx >= len(workout_source):
+                day_idx = 0
+
+            day = (workout_source[day_idx] if day_idx < len(workout_source) else workout_preview[0]) or {}
+            day_name = target_label
+            source_day = str(day.get("day", f"Day {day_idx + 1}"))
             warmup = day.get("warmup") if isinstance(day.get("warmup"), list) else []
             exercises = day.get("exercises") if isinstance(day.get("exercises"), list) else []
             cooldown = day.get("cooldown") if isinstance(day.get("cooldown"), list) else []
 
-            lines.append(f"Workout ({day_name}):")
+            label = "Post-travel workout preview" if travel_days > 0 else "Workout"
+            lines.append(f"{label} ({day_name} | {source_day}):")
+            if travel_days > 0:
+                lines.append("- During travel days: no structured workout required.")
             if warmup:
                 lines.append(f"- Warm-up: {', '.join([str(x) for x in warmup[:2]])}")
             if exercises:
@@ -594,14 +1101,19 @@ Return STRICT JSON only:
                 lines.append(f"- Cool-down: {', '.join([str(x) for x in cooldown[:2]])}")
 
         if nutrition_preview:
-            day = nutrition_preview[0] or {}
-            day_name = day.get("day", "Day 1")
+            day_idx = cycle_day_idx if travel_days <= 0 else min(travel_days, max(len(nutrition_source) - 1, 0))
+            if day_idx >= len(nutrition_source):
+                day_idx = 0
+            day = (nutrition_source[day_idx] if day_idx < len(nutrition_source) else nutrition_preview[0]) or {}
+            day_name = target_label
+            source_day = str(day.get("day", f"Day {day_idx + 1}"))
             breakfast = day.get("breakfast") if isinstance(day.get("breakfast"), list) else []
             lunch = day.get("lunch") if isinstance(day.get("lunch"), list) else []
             snacks = day.get("snacks") if isinstance(day.get("snacks"), list) else []
             dinner = day.get("dinner") if isinstance(day.get("dinner"), list) else []
 
-            lines.append(f"Meals ({day_name}):")
+            label = "Meals (Compensation phase)" if travel_days > 0 else f"Meals ({day_name} | {source_day})"
+            lines.append(f"{label}:")
             if breakfast:
                 lines.append(f"- Breakfast: {breakfast[0]}")
             if lunch:
@@ -617,13 +1129,73 @@ Return STRICT JSON only:
         lines.append("Send an evening check-in and I will adapt tomorrow's plan if needed.")
         return "\n".join(lines)
 
+    # Only force plan-shaped responses when user intent is explicitly plan-related.
+    # Background plan refreshes should not hijack normal conversational replies.
     should_force_plan_format = bool(
         user_intent.get("today_plan_query")
-        or (plan_updates.get("workout") is not None)
-        or (plan_updates.get("nutrition") is not None)
+        or user_intent.get("post_travel_query")
         or bool(decision.get("user_requests_restructure", False))
-        or bool(decision.get("compensation_requested", False))
+        or bool(decision.get("resume_training_query", False))
     )
+
+    if user_intent.get("cravings_query"):
+        swaps_payload = plan_updates.get("craving_swaps") if isinstance(plan_updates.get("craving_swaps"), dict) else {}
+        swaps = swaps_payload.get("swaps") if isinstance(swaps_payload.get("swaps"), list) else []
+        rule = str(swaps_payload.get("rule", "Use a cleaner swap first, then decide after 10 minutes.")).strip()
+        fallback_snack = str(swaps_payload.get("fallback_snack", "Fruit + nuts")).strip()
+
+        lines = [
+            "Love this question. Here are tasty options so you can stay on plan without feeling restricted:",
+        ]
+        for item in swaps[:5]:
+            if not isinstance(item, dict):
+                continue
+            craving = str(item.get("craving", "Junk craving")).strip()
+            better = str(item.get("better_option", "Protein + fiber snack")).strip()
+            tip = str(item.get("portion_tip", "Keep portions controlled.")).strip()
+            lines.append(f"- {craving} -> {better} ({tip})")
+
+        lines.append(f"Rule: {rule}")
+        lines.append(f"Emergency fallback: {fallback_snack}")
+
+        return {
+            "summary": "Shared tasty plan-friendly alternatives for junk cravings.",
+            "ai_reply": "\n".join(lines),
+            "meta": {
+                "fallback_used": False,
+                "fallback_reason": None,
+            },
+        }
+
+    # Deterministic summary path for progress-count questions.
+    if user_intent.get("log_summary_query"):
+        workout_days = int(progress_summary.get("total_workout_days", _count_workout_days(recent_logs)))
+        meal_days = int(progress_summary.get("total_meal_log_days", _count_meal_logged_days(recent_logs)))
+        total_logs = int(progress_summary.get("total_daily_logs", len(recent_logs)))
+        total_minutes = int(progress_summary.get("total_workout_minutes", 0))
+        recent_history = progress_summary.get("recent_workout_history") if isinstance(progress_summary.get("recent_workout_history"), list) else []
+        travel_days = int(decision.get("travel_days") or 0)
+
+        lines = [f"Workout days completed so far: {workout_days}"]
+        lines.append(f"Meal-log days so far: {meal_days}")
+        lines.append(f"Total daily logs stored: {total_logs}")
+        lines.append(f"Total workout minutes logged: {total_minutes}")
+        if recent_history:
+            last_entries = recent_history[:3]
+            formatted = ", ".join([f"{x.get('date')}: {x.get('workout_minutes', 0)} min" for x in last_entries])
+            lines.append(f"Recent workout history: {formatted}")
+        if travel_days > 0:
+            lines.append(f"Active travel window detected: {travel_days} day(s) remaining in current travel context.")
+        lines.append("Keep sending daily updates and I will keep this count accurate.")
+
+        return {
+            "summary": f"Logged workout count: {workout_days} day(s).",
+            "ai_reply": "\n".join(lines),
+            "meta": {
+                "fallback_used": False,
+                "fallback_reason": None,
+            },
+        }
 
     def _apply_plan_format_if_needed(summary: str, ai_reply: str) -> Dict[str, str]:
         if not should_force_plan_format:
@@ -856,6 +1428,71 @@ def _build_nudges(logs: List[Dict[str, Any]], autonomous: bool) -> List[str]:
     return nudges[:3]
 
 
+def _resolve_allotted_workout_minutes(profile: Dict[str, Any]) -> int:
+    planned = profile.get("exercise")
+    if isinstance(planned, (int, float)) and int(planned) > 0:
+        return int(planned)
+    return 30
+
+
+def _is_travel_resume_message(message: str) -> bool:
+    text = (message or "").strip().lower()
+    if not text:
+        return False
+
+    resume_tokens = [
+        "travel done",
+        "travelling done",
+        "traveling done",
+        "travelling is done",
+        "traveling is done",
+        "travel is done",
+        "done with travelling",
+        "done with traveling",
+        "done travelling",
+        "done traveling",
+        "travel is over",
+        "travelling is over",
+        "traveling is over",
+        "trip is over",
+        "back from travel",
+        "back from trip",
+        "returned from travel",
+        "returned from trip",
+        "can start from today",
+        "starting from today",
+        "start from today",
+        "resume workout",
+        "resume training",
+    ]
+    return any(token in text for token in resume_tokens)
+
+
+def _is_completion_message(message: str) -> bool:
+    text = (message or "").strip().lower()
+    if not text:
+        return False
+
+    if _is_travel_resume_message(text):
+        return False
+
+    completion_tokens = [
+        "finished",
+        "done",
+        "completed",
+        "wrapped up",
+        "over",
+    ]
+    context_tokens = [
+        "workout",
+        "work",
+        "plan",
+        "tasks",
+    ]
+
+    return any(t in text for t in completion_tokens) and any(t in text for t in context_tokens)
+
+
 def _weekly_reflection(goal: str, logs: List[Dict[str, Any]]) -> Dict[str, Any]:
     if not logs:
         return {
@@ -907,8 +1544,270 @@ def _compute_recovery_mode(logs: List[Dict[str, Any]], window: int = 3, threshol
     }
 
 
+def _count_workout_days(logs: List[Dict[str, Any]]) -> int:
+    count = 0
+    for item in logs:
+        minutes = item.get("workout_minutes", 0)
+        completed = item.get("workout_completed", False)
+        if bool(completed) or (isinstance(minutes, (int, float)) and int(minutes) > 0):
+            count += 1
+    return count
+
+
+def _count_meal_logged_days(logs: List[Dict[str, Any]]) -> int:
+    count = 0
+    for item in logs:
+        meal = (item.get("meal_text") or "").strip()
+        meal_logged = bool(item.get("meal_logged", False))
+        if meal or meal_logged:
+            count += 1
+    return count
+
+
+def _infer_active_travel_days(
+    recent_logs: List[Dict[str, Any]],
+    latest_agent_event: Dict[str, Any],
+    explicit_travel_days: int,
+) -> int:
+    if explicit_travel_days > 0:
+        return explicit_travel_days
+
+    if recent_logs and bool(recent_logs[0].get("travel_window_closed", False)):
+        return 0
+
+    today = _utc_now().date()
+
+    # Prefer structured daily logs with travel_days + date.
+    dated_candidates: List[tuple[date, int]] = []
+    for item in recent_logs:
+        raw_date = item.get("date")
+        td = item.get("travel_days")
+        if not isinstance(raw_date, str) or not isinstance(td, int) or td <= 0:
+            continue
+        try:
+            d = datetime.strptime(raw_date, "%Y-%m-%d").date()
+        except Exception:
+            continue
+        dated_candidates.append((d, td))
+
+    if dated_candidates:
+        start_date, total = max(dated_candidates, key=lambda x: x[0])
+        elapsed = max(0, (today - start_date).days)
+        remaining = max(0, total - elapsed)
+        if remaining > 0:
+            return remaining
+
+    # Fallback: latest agent decision context.
+    decision = latest_agent_event.get("decision") if isinstance(latest_agent_event, dict) else {}
+    if isinstance(decision, dict):
+        td = decision.get("travel_days")
+        travel_flag = bool(decision.get("travel_disruption", False))
+        if travel_flag and isinstance(td, int) and td > 0:
+            return min(14, td)
+
+    return 0
+
+
+def _infer_intent_overrides(message: str) -> Dict[str, bool]:
+    text = (message or "").strip().lower()
+    if not text:
+        return {
+            "today_plan_query": False,
+            "log_summary_query": False,
+            "post_travel_query": False,
+            "resume_training_query": False,
+            "cravings_query": False,
+        }
+
+    # Normalize common stretch typos like "todayy" -> "today".
+    normalized_text = re.sub(r"\btoday+\b", "today", text)
+
+    today_plan_query = any(
+        token in normalized_text
+        for token in [
+            "plan for today",
+            "what's the plan for today",
+            "whats the plan for today",
+            "today's plan",
+            "todays plan",
+            "what should i do today",
+            "what do i do today",
+            "what to do today",
+        ]
+    )
+
+    # Fallback regex for casual variants like "what to do todayy".
+    if not today_plan_query:
+        today_plan_query = bool(
+            re.search(r"\b(?:what|whats|what's)?\s*(?:to\s+)?do\s+today\b", normalized_text)
+            or re.search(r"\b(?:plan|routine|schedule)\s+(?:for\s+)?today\b", normalized_text)
+        )
+
+    plan_update_status_query = any(
+        token in normalized_text
+        for token in [
+            "did you update the plan",
+            "have you updated the plan",
+            "is the plan updated",
+            "is plan updated",
+            "plan updated",
+            "updated plan",
+            "did you update my plan",
+            "have you updated my plan",
+        ]
+    )
+
+    if not plan_update_status_query:
+        plan_update_status_query = bool(
+            re.search(r"\b(?:did|have)\s+you\s+update(?:d)?\s+(?:my\s+)?plan\b", normalized_text)
+            or re.search(r"\b(?:is\s+)?(?:my\s+)?plan\s+updated\b", normalized_text)
+        )
+
+    if plan_update_status_query:
+        today_plan_query = True
+
+    workout_count_query = any(token in normalized_text for token in ["how many days", "give me the count", "count of days", "days i've done", "days i have done"]) and any(
+        token in normalized_text for token in ["workout", "work out", "exercise", "trained"]
+    )
+
+    progress_summary_query = any(
+        token in normalized_text
+        for token in [
+            "what's my progress",
+            "whats my progress",
+            "my progress so far",
+            "progress so far",
+            "show progress",
+            "how is my progress",
+        ]
+    )
+
+    # Today-plan intent should always take priority over summary intent.
+    if today_plan_query:
+        workout_count_query = False
+        progress_summary_query = False
+
+    post_travel_query = any(
+        token in normalized_text
+        for token in [
+            "after travel",
+            "post travel",
+            "after my trip",
+            "once i return",
+            "when i return",
+            "what after travel",
+            "plan after travel",
+        ]
+    )
+
+    cravings_query = any(
+        token in normalized_text
+        for token in [
+            "junk food",
+            "craving",
+            "feel like eating",
+            "tempted",
+            "snack recommendation",
+            "recommend something tasty",
+        ]
+    )
+
+    resume_training_query = _is_travel_resume_message(normalized_text)
+    if resume_training_query:
+        today_plan_query = True
+        workout_count_query = False
+        progress_summary_query = False
+
+    return {
+        "today_plan_query": today_plan_query,
+        "log_summary_query": workout_count_query or progress_summary_query,
+        "post_travel_query": post_travel_query,
+        "resume_training_query": resume_training_query,
+        "cravings_query": cravings_query,
+    }
+
+
+def _craving_swap_recommendations(goal: str, message: str, travel_days: int) -> Dict[str, Any]:
+    prompt = f"""
+You are a practical nutrition coach.
+User goal: {goal}
+User message: {message}
+Active travel days remaining: {travel_days}
+
+Give tasty alternatives to junk cravings without deviating from plan.
+Focus on easy Indian options.
+
+Return STRICT JSON only:
+{{
+  "swaps": [
+    {{"craving": "", "better_option": "", "portion_tip": ""}}
+  ],
+  "rule": "single simple rule",
+  "fallback_snack": "one emergency snack"
+}}
+"""
+
+    try:
+        raw = generate_ai_response(prompt)
+        payload = _safe_json_loads(raw)
+        swaps = payload.get("swaps") if isinstance(payload.get("swaps"), list) else []
+        cleaned_swaps: List[Dict[str, str]] = []
+        for item in swaps[:5]:
+            if not isinstance(item, dict):
+                continue
+            craving = str(item.get("craving", "")).strip()
+            better = str(item.get("better_option", "")).strip()
+            tip = str(item.get("portion_tip", "")).strip()
+            if craving or better:
+                cleaned_swaps.append(
+                    {
+                        "craving": craving or "Junk craving",
+                        "better_option": better or "Protein + fiber snack",
+                        "portion_tip": tip or "Keep portion controlled and eat slowly.",
+                    }
+                )
+
+        return {
+            "swaps": cleaned_swaps,
+            "rule": str(payload.get("rule", "Use the 80/20 rule: satisfy craving with a cleaner swap first.")).strip(),
+            "fallback_snack": str(payload.get("fallback_snack", "Roasted chana + buttermilk")).strip(),
+        }
+    except Exception:
+        return {
+            "swaps": [
+                {
+                    "craving": "Chips",
+                    "better_option": "Roasted makhana with masala",
+                    "portion_tip": "Use a small bowl (not the packet).",
+                },
+                {
+                    "craving": "Chocolate",
+                    "better_option": "2 squares dark chocolate + nuts",
+                    "portion_tip": "Pair with water or tea, avoid second serving.",
+                },
+                {
+                    "craving": "Burger/Pizza",
+                    "better_option": "Paneer/egg wrap on roti with salad",
+                    "portion_tip": "Limit sauces and avoid sugary drink.",
+                },
+            ],
+            "rule": "Delay by 10 minutes, then choose the cleaner swap first.",
+            "fallback_snack": "Fruit + peanut butter",
+        }
+
+
 def _summarize_response(decision: Dict[str, Any], nudges: List[str], plan_updates: Dict[str, Any]) -> str:
     parts = []
+    travel_days = int(decision.get("travel_days") or 0)
+    if travel_days > 0:
+        parts.append(f"Travel-aware plan restructured for {travel_days} day(s)")
+
+    if bool(decision.get("active_travel_window", False)):
+        parts.append("Active travel window plan refresh applied")
+
+    if bool(decision.get("meal_on_track_workout_missed", False)):
+        parts.append("Meals on track but workout missed; compensation update prepared")
+
     if decision.get("recovery_mode", {}).get("enabled"):
         parts.append("Recovery mode activated for easier re-entry")
 
@@ -974,9 +1873,61 @@ def run_agent(request: AgentRequest) -> AgentResponse:
     trace.append(AgentStep(name="observe", status="ok", detail="Loaded user state", output=observed))
 
     structured_logs = _extract_structured_logs_with_ai(request.message or "")
+
+    progress_summary = _fetch_progress_summary(request.user_id)
+
+    travel_resume_message = _is_travel_resume_message(request.message or "")
+    if travel_resume_message:
+        structured_logs["travel_window_closed"] = True
+        structured_logs["travel_disruption"] = False
+        structured_logs["travel_days"] = 0
+        structured_logs["compensation_request"] = False
+        structured_logs.pop("workout_completed", None)
+        structured_logs.pop("workout_minutes", None)
+        structured_logs.pop("workout_day_number", None)
+        structured_logs.pop("meal_logged", None)
+
+    # Deterministic guardrail: if user clearly reports completion, enforce
+    # completion fields even if LLM parsing is weak.
+    if _is_completion_message(request.message or ""):
+        structured_logs["workout_completed"] = True
+        structured_logs["meal_logged"] = True
+
+        if not isinstance(structured_logs.get("workout_day_number"), int):
+            prev_days = int(progress_summary.get("total_workout_days", 0))
+            structured_logs["workout_day_number"] = prev_days + 1
+
+    # If user confirms completion without explicit minutes, store planned minutes
+    # so workout totals and history reflect the completed day.
+    if structured_logs.get("workout_completed"):
+        minutes = structured_logs.get("workout_minutes")
+        if not isinstance(minutes, (int, float)) or int(minutes) <= 0:
+            structured_logs["workout_minutes"] = _resolve_allotted_workout_minutes(merged_profile)
+
+        # If multiple plan days are completed on the same calendar day,
+        # accumulate minutes when day number progresses (e.g., day 1 -> day 2).
+        existing_today = _fetch_daily_log(request.user_id)
+        existing_minutes = existing_today.get("workout_minutes")
+        existing_day_num = existing_today.get("workout_day_number")
+        incoming_day_num = structured_logs.get("workout_day_number")
+
+        if (
+            isinstance(existing_minutes, (int, float))
+            and int(existing_minutes) >= 0
+            and isinstance(incoming_day_num, int)
+            and incoming_day_num > 0
+            and isinstance(existing_day_num, (int, float))
+            and int(existing_day_num) > 0
+            and incoming_day_num > int(existing_day_num)
+        ):
+            structured_logs["workout_minutes"] = int(existing_minutes) + int(structured_logs.get("workout_minutes", 0) or 0)
+
     if structured_logs:
         _upsert_daily_log(request.user_id, structured_logs)
+        all_logs = _fetch_all_daily_logs(request.user_id)
+        progress_summary = _refresh_progress_summary(request.user_id, logs=all_logs)
         actions.append("daily_log_updated")
+        actions.append("progress_summary_updated")
         trace.append(
             AgentStep(
                 name="auto_log",
@@ -986,6 +1937,9 @@ def run_agent(request: AgentRequest) -> AgentResponse:
             )
         )
     else:
+        if not progress_summary:
+            all_logs = _fetch_all_daily_logs(request.user_id)
+            progress_summary = _refresh_progress_summary(request.user_id, logs=all_logs)
         trace.append(AgentStep(name="auto_log", status="skipped", detail="No structured logs detected", output={}))
 
     goal = _resolve_goal(request.goal, merged_profile.get("goal"), request.message or "")
@@ -1009,19 +1963,77 @@ def run_agent(request: AgentRequest) -> AgentResponse:
 
     message_l = (request.message or "").lower()
     inferred_completion_from_logs = structured_logs.get("adherence_status") == "good"
-    today_plan_query = bool(llm_brain.get("today_plan_query", False))
-    log_summary_query = bool(llm_brain.get("log_summary_query", False))
+    intent_overrides = _infer_intent_overrides(request.message or "")
+    today_plan_query = bool(llm_brain.get("today_plan_query", False)) or intent_overrides["today_plan_query"]
+    log_summary_query = bool(llm_brain.get("log_summary_query", False)) or intent_overrides["log_summary_query"]
+    post_travel_query = bool(intent_overrides.get("post_travel_query", False))
+    resume_training_query = bool(intent_overrides.get("resume_training_query", False))
+    cravings_query = bool(intent_overrides.get("cravings_query", False))
+    travel_resume_signal = bool(travel_resume_message or resume_training_query)
+
+    # Guardrail: if user asks for today's plan, do not route to progress summary.
+    if today_plan_query:
+        log_summary_query = False
+
     travel_disruption = bool(llm_brain.get("travel_disruption", False)) or bool(structured_logs.get("travel_disruption", False))
     compensation_requested = bool(llm_brain.get("compensation_requested", False)) or bool(structured_logs.get("compensation_request", False))
+    explicit_travel_days = _extract_travel_days(request.message or "")
+    if isinstance(structured_logs.get("travel_days"), int) and structured_logs["travel_days"] > 0:
+        explicit_travel_days = max(explicit_travel_days, int(structured_logs["travel_days"]))
+
+    travel_days = _infer_active_travel_days(
+        recent_logs=recent_logs,
+        latest_agent_event=latest_agent_event,
+        explicit_travel_days=explicit_travel_days,
+    )
+    if travel_resume_signal:
+        travel_days = 0
+        travel_disruption = False
+        compensation_requested = False
+
+    active_travel_window = travel_days > 0
+    if travel_days > 0:
+        travel_disruption = True
+        # Keep compensation active through the travel window so forward plan
+        # remains restructured and persisted each time the user checks in.
+        compensation_requested = True
     completion_update = bool(llm_brain.get("completion_update", False)) or (
         inferred_completion_from_logs and not today_plan_query
     )
+
+    meal_logged_today = bool(structured_logs.get("meal_logged")) or bool((structured_logs.get("meal_text") or "").strip())
+    workout_minutes_today = structured_logs.get("workout_minutes")
+    workout_completed_today = structured_logs.get("workout_completed")
+    explicit_missed_workout = any(
+        token in message_l
+        for token in [
+            "missed workout",
+            "skipped workout",
+            "didn't workout",
+            "didnt workout",
+            "no workout",
+            "couldn't workout",
+            "couldnt workout",
+        ]
+    )
+    workout_missed_today = bool(
+        explicit_missed_workout
+        or (workout_completed_today is False and isinstance(workout_minutes_today, (int, float)) and int(workout_minutes_today) == 0)
+    )
+    meal_on_track_workout_missed = bool(meal_logged_today and workout_missed_today)
+
+    if meal_on_track_workout_missed:
+        compensation_requested = True
     food_adapter_needed = llm_brain.get("needs_food_adaptation", False) or ("only have" in message_l)
     food_adapter = _food_reality_adapter(goal, request.message or "") if food_adapter_needed else {}
 
     llm_wants_refresh = llm_brain.get("should_refresh_plan", False)
     if compensation_requested:
         llm_wants_refresh = True
+    if meal_on_track_workout_missed:
+        llm_wants_refresh = True
+    if cravings_query:
+        llm_wants_refresh = False
     if completion_update and not today_plan_query and request.mode != "plan":
         # Completion updates should not re-trigger full plan refresh by default.
         llm_wants_refresh = False
@@ -1034,6 +2046,11 @@ def run_agent(request: AgentRequest) -> AgentResponse:
         "needs_food_adaptation": bool(food_adapter),
         "recovery_mode": recovery_mode,
         "travel_disruption": travel_disruption,
+        "travel_days": travel_days,
+        "travel_resumed": travel_resume_signal,
+        "active_travel_window": active_travel_window,
+        "cravings_query": cravings_query,
+        "meal_on_track_workout_missed": meal_on_track_workout_missed,
         "compensation_requested": compensation_requested,
         "user_requests_restructure": llm_brain.get("user_requests_restructure", False),
         "should_initialize_plan": not has_existing_plans,
@@ -1042,13 +2059,20 @@ def run_agent(request: AgentRequest) -> AgentResponse:
             or bool(drift.get("should_adapt_plan"))
             or request.mode == "plan"
             or not has_existing_plans
+            or resume_training_query
             or bool(food_adapter)
             or recovery_mode.get("enabled", False)
+            or meal_on_track_workout_missed
+            or active_travel_window
         ),
         "weekly_reflection_requested": llm_brain.get("weekly_reflection_requested", False)
         or request.mode == "weekly_reflection"
         or "weekly" in (request.message or "").lower(),
+        "resume_training_query": resume_training_query,
     }
+
+    if cravings_query and request.mode != "plan":
+        decision["should_refresh_plan"] = False
     trace.append(AgentStep(name="decide", status="ok", detail="Computed plan/nudge decisions", output=decision))
 
     plan_updates: Dict[str, Any] = {}
@@ -1069,14 +2093,54 @@ def run_agent(request: AgentRequest) -> AgentResponse:
             workout_input.time_per_day = min(60, max(30, workout_input.time_per_day))
             actions.append("travel_compensation_planned")
 
+        if meal_on_track_workout_missed:
+            # User followed meals but missed workout: compensate with a practical bump.
+            workout_input.time_per_day = min(75, max(30, workout_input.time_per_day + 10))
+            nutrition_input.activity = "low"
+            actions.append("meal_on_track_workout_compensation")
+
         if drift.get("status") == "behind":
             workout_input.time_per_day = min(90, max(20, workout_input.time_per_day + 10))
 
-        plan_updates["workout"] = generate_workout_plan(workout_input)
-        plan_updates["nutrition"] = generate_nutrition_plan(nutrition_input)
+        base_workout_plan = (current_workout or {}).get("plan") if isinstance(current_workout, dict) else None
+        base_nutrition_plan = (current_nutrition or {}).get("plan") if isinstance(current_nutrition, dict) else None
+
+        if compensation_requested and travel_disruption and travel_days > 0:
+            # Dynamic rewrite from existing plans, driven by user-specified travel duration.
+            if not isinstance(base_workout_plan, list) or not base_workout_plan:
+                base_workout_plan = generate_workout_plan(workout_input).get("plan", [])
+            if not isinstance(base_nutrition_plan, list) or not base_nutrition_plan:
+                base_nutrition_plan = generate_nutrition_plan(nutrition_input).get("plan", [])
+
+            adaptive = _adaptive_travel_compensation_with_ai(
+                goal=goal,
+                message=request.message or "",
+                travel_days=travel_days,
+                base_workout_plan=base_workout_plan,
+                base_nutrition_plan=base_nutrition_plan,
+            )
+
+            if adaptive:
+                plan_updates["workout"] = adaptive["workout"]
+                plan_updates["nutrition"] = adaptive["nutrition"]
+                actions.append("travel_window_structured_dynamic")
+            else:
+                # Deterministic fallback if model output is malformed.
+                plan_updates["workout"] = _build_travel_compensation_workout_plan(base_workout_plan, travel_days)
+                plan_updates["nutrition"] = _build_travel_compensation_nutrition_plan(base_nutrition_plan, travel_days)
+            actions.append("travel_window_structured")
+        else:
+            plan_updates["workout"] = generate_workout_plan(workout_input)
+            plan_updates["nutrition"] = generate_nutrition_plan(nutrition_input)
 
         if decision.get("should_initialize_plan"):
             reason = "initial_agent_plan"
+        elif resume_training_query:
+            reason = "post_travel_resume_restructure"
+        elif active_travel_window:
+            reason = "active_travel_window_restructure"
+        elif meal_on_track_workout_missed:
+            reason = "missed_workout_compensation_with_nutrition_adherence"
         elif compensation_requested:
             reason = "travel_disruption_compensation"
         elif recovery_mode.get("enabled"):
@@ -1123,6 +2187,10 @@ def run_agent(request: AgentRequest) -> AgentResponse:
         plan_updates["food_reality_adapter"] = food_adapter
         actions.append("food_adaptation_generated")
 
+    if cravings_query:
+        plan_updates["craving_swaps"] = _craving_swap_recommendations(goal, request.message or "", travel_days)
+        actions.append("craving_swaps_generated")
+
     for hint in llm_brain.get("action_hints", []):
         action_label = f"ai_hint:{hint}"
         if action_label not in actions:
@@ -1162,6 +2230,8 @@ def run_agent(request: AgentRequest) -> AgentResponse:
             "today_plan_query": today_plan_query,
             "completion_update": completion_update,
             "log_summary_query": log_summary_query,
+            "post_travel_query": post_travel_query,
+            "cravings_query": cravings_query,
         },
         decision=decision,
         actions=actions,
@@ -1171,6 +2241,7 @@ def run_agent(request: AgentRequest) -> AgentResponse:
             "workout": current_workout,
             "nutrition": current_nutrition,
         },
+        progress_summary=progress_summary,
         weekly_reflection=weekly,
         recent_logs=recent_logs,
         structured_logs=structured_logs,
@@ -1193,6 +2264,7 @@ def run_agent(request: AgentRequest) -> AgentResponse:
             "workout": current_workout,
             "nutrition": current_nutrition,
         },
+        progress_summary=progress_summary,
         structured_logs=structured_logs,
         plan_updates=plan_updates,
         weekly_reflection=weekly,
@@ -1210,6 +2282,7 @@ def run_agent(request: AgentRequest) -> AgentResponse:
             "response_meta": decision.get("response_meta", {}),
             "actions": actions,
             "decision": decision,
+            "progress_summary": progress_summary,
             "structured_logs": structured_logs,
         },
     )
@@ -1224,6 +2297,7 @@ def run_agent(request: AgentRequest) -> AgentResponse:
             "actions": actions,
             "decision": decision,
             "response_meta": decision.get("response_meta", {}),
+            "progress_summary": progress_summary,
             "structured_logs": structured_logs,
             "plan_updates": plan_updates,
             "weekly_reflection": weekly,
