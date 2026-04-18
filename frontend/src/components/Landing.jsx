@@ -1,6 +1,8 @@
 import { useNavigate } from "react-router-dom";
 import { useState } from "react";
 import { loginWithGoogle } from "../services/authService";
+import { db } from "../services/firebase";
+import { collection, getDocs, limit, query } from "firebase/firestore";
 import dashboardPreview from "../components/dashboard-preview.png";
 import "./Landing.css";
 
@@ -8,14 +10,27 @@ const Landing = () => {
   const navigate = useNavigate();
   const [loading, setLoading] = useState(false);
 
+  const routeAfterLogin = async (uid) => {
+    const q = query(collection(db, "users", uid, "healthRecords"), limit(1));
+    const snap = await getDocs(q);
+
+    if (snap.empty) {
+      navigate("/form");
+      return;
+    }
+
+    // Existing users go straight to agent (coach)
+    navigate("/coach");
+  };
+
   const handleGetStarted = async () => {
     if (loading) return;
     setLoading(true);
 
     try {
-      const { idToken } = await loginWithGoogle();
+      const { idToken, user } = await loginWithGoogle();
       console.log("Firebase ID Token:", idToken);
-      navigate("/form");
+      await routeAfterLogin(user.uid);
     } catch (err) {
       console.error("Google login failed:", err);
       alert(err?.message || "Google login failed");

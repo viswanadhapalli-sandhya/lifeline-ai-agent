@@ -1,13 +1,71 @@
+import { useEffect, useState } from "react";
 import TopNav from "../components/TopNav";
+import { auth, db } from "../services/firebase";
+import { collection, limit, onSnapshot, orderBy, query } from "firebase/firestore";
 
 export default function Workouts() {
-  let plan = null;
+  const [plan, setPlan] = useState(null);
+  const [loading, setLoading] = useState(true);
   let risk = null;
 
   try {
-    plan = JSON.parse(localStorage.getItem("workoutPlan") || "null");
     risk = JSON.parse(localStorage.getItem("riskResult") || "null");
   } catch {}
+
+  useEffect(() => {
+    const user = auth.currentUser;
+
+    // Fallback for local cache.
+    let cached = null;
+    try {
+      cached = JSON.parse(localStorage.getItem("workoutPlan") || "null");
+    } catch {}
+
+    if (!user) {
+      setPlan(cached);
+      setLoading(false);
+      return;
+    }
+
+    const q = query(
+      collection(db, "users", user.uid, "workoutPlans"),
+      orderBy("createdAt", "desc"),
+      limit(1)
+    );
+
+    const unsub = onSnapshot(
+      q,
+      (snap) => {
+        if (!snap.empty) {
+          const latest = snap.docs[0].data();
+          const resolved = { plan: latest.plan || [] };
+          setPlan(resolved);
+          try {
+            localStorage.setItem("workoutPlan", JSON.stringify(resolved));
+          } catch {}
+        } else {
+          setPlan(cached);
+        }
+        setLoading(false);
+      },
+      (e) => {
+        console.error(e);
+        setPlan(cached);
+        setLoading(false);
+      }
+    );
+
+    return () => unsub();
+  }, []);
+
+  if (loading) {
+    return (
+      <div className="min-h-screen bg-[radial-gradient(circle_at_top,#0f172a,#020617)] text-white">
+        <TopNav rightText="Dashboard" onRightClick={() => (window.location.href = "/")} />
+        <div className="max-w-4xl mx-auto px-4 py-24 text-center">Loading...</div>
+      </div>
+    );
+  }
 
   // 🔴 No workout generated yet
   if (!plan || !plan.plan) {

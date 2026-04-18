@@ -1,5 +1,5 @@
 import json
-from core.groq_client import generate_ai_response
+from app.core.groq_client import generate_ai_response
 
 import re
 

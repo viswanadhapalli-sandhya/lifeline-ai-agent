@@ -113,8 +113,8 @@ localStorage.setItem("riskResult", JSON.stringify(risk));
 localStorage.setItem("analysisResult", JSON.stringify(analysis));
 console.log("Saved to localStorage");
 
-// 5) Go dashboard
-navigate("/dashboard");
+// 5) Go directly to agent coach
+navigate("/coach");
 
 
     } catch (err) {

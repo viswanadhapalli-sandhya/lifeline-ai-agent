@@ -1,6 +1,6 @@
-from core.groq_client import generate_ai_response
+from app.core.groq_client import generate_ai_response
 from firebase_admin import firestore
-from core.firebase_client import db
+from app.core.firebase_client import db
 import json
 def normalize_ai_response(ai_response: str):
     try:

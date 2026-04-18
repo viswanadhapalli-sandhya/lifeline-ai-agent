@@ -1,7 +1,7 @@
 import json
-from core.groq_client import generate_ai_response
-from core.firebase_client import db
-from services.risk_engine import simple_risk_engine
+from app.core.groq_client import generate_ai_response
+from app.core.firebase_client import db
+from app.services.risk_engine import simple_risk_engine
 
 
 # --------------------------------------------------

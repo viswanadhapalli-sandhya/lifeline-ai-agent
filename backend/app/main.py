@@ -1,18 +1,24 @@
 import os
 from typing import List, Optional, Dict, Any
+from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv()
+# Load env files explicitly so startup works from either backend/ or backend/app/ cwd.
+APP_DIR = Path(__file__).resolve().parent
+BACKEND_DIR = APP_DIR.parent
+load_dotenv(BACKEND_DIR / ".env")
+load_dotenv(APP_DIR / ".env")
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from routers.workout import router as workout_router
-from services.analyze_service import analyze_user
-from schemas.predict_schema import PredictRequest
+from app.routers.workout import router as workout_router
+from app.services.analyze_service import analyze_user
+from app.schemas.predict_schema import PredictRequest
 
-from routers.nutrition import router as nutrition_router
-from routers.chat import router as chat_router
+from app.routers.nutrition import router as nutrition_router
+from app.routers.chat import router as chat_router
+from app.routers.agent import router as agent_router
 
 
 
@@ -26,6 +32,7 @@ app = FastAPI(
 app.include_router(workout_router)
 app.include_router(nutrition_router)
 app.include_router(chat_router)
+app.include_router(agent_router)
 # -----------------------------
 # CORS (frontend -> backend)
 # -----------------------------

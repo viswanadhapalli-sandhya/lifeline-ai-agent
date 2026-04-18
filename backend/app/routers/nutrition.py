@@ -1,6 +1,6 @@
 from fastapi import APIRouter
-from schemas.nutrition import NutritionRequest
-from services.nutrition_service import generate_nutrition_plan
+from app.schemas.nutrition import NutritionRequest
+from app.services.nutrition_service import generate_nutrition_plan
 
 router = APIRouter(prefix="/nutrition", tags=["Nutrition"])
 

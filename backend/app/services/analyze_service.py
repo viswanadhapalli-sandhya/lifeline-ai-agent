@@ -1,6 +1,6 @@
 import json
-from core.groq_client import generate_ai_response
-from services.risk_engine import simple_risk_engine
+from app.core.groq_client import generate_ai_response
+from app.services.risk_engine import simple_risk_engine
 
 def analyze_user(req):
     risk = simple_risk_engine(req)

@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { auth, db } from "../services/firebase";
-import { collection, getDocs, orderBy, query, limit } from "firebase/firestore";
+import { collection, orderBy, query, limit, onSnapshot } from "firebase/firestore";
 import TopNav from "../components/TopNav";
 
 export default function Nutrition() {
@@ -8,33 +8,47 @@ export default function Nutrition() {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    const load = async () => {
-      const user = auth.currentUser;
-      if (!user) {
-        setLoading(false);
-        return;
-      }
+    const user = auth.currentUser;
 
-      try {
-        const q = query(
-          collection(db, "users", user.uid, "nutritionPlans"),
-          orderBy("createdAt", "desc"),
-          limit(1)
-        );
+    let cached = null;
+    try {
+      cached = JSON.parse(localStorage.getItem("nutritionPlan") || "null");
+    } catch {}
 
-        const snap = await getDocs(q);
+    if (!user) {
+      setPlan(cached);
+      setLoading(false);
+      return;
+    }
 
+    const q = query(
+      collection(db, "users", user.uid, "nutritionPlans"),
+      orderBy("createdAt", "desc"),
+      limit(1)
+    );
+
+    const unsub = onSnapshot(
+      q,
+      (snap) => {
         if (!snap.empty) {
-          setPlan(snap.docs[0].data().plan);
+          const latestPlan = snap.docs[0].data().plan || [];
+          setPlan(latestPlan);
+          try {
+            localStorage.setItem("nutritionPlan", JSON.stringify(latestPlan));
+          } catch {}
+        } else {
+          setPlan(cached);
         }
-      } catch (e) {
+        setLoading(false);
+      },
+      (e) => {
         console.error(e);
-      } finally {
+        setPlan(cached);
         setLoading(false);
       }
-    };
+    );
 
-    load();
+    return () => unsub();
   }, []);
 
   if (loading) return <div className="text-white p-8">Loading...</div>;

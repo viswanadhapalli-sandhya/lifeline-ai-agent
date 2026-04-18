@@ -11,8 +11,6 @@ import {
   orderBy,
   query,
   limit,
-  addDoc,
-  serverTimestamp,
 } from "firebase/firestore";
 
 
@@ -25,97 +23,51 @@ export default function Dashboard() {
   const [loadingData, setLoadingData] = useState(false);
   const [records, setRecords] = useState([]);
   const [err, setErr] = useState("");
-  const handleWorkoutClick = async () => {
-  console.log("Workout button clicked");
-
-  if (!user) {
-    alert("User not logged in");
-    return;
-  }
-
-  try {
-    const res = await fetch("http://localhost:8000/workouts/generate", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        goal: "general fitness",
-        location: "home",
-        time_per_day: 30,
-        fitness_level: "beginner",
-        equipment: "none",
-      }),
-    });
-
-    const text = await res.text();
-    const plan = JSON.parse(text);
-
-    // 🔒 VALIDATION
-    if (!plan.plan || !Array.isArray(plan.plan)) {
-      throw new Error("Invalid workout plan format");
-    }
-
-    // ✅ SAVE TO FIRESTORE (USER-SPECIFIC)
-    await addDoc(
-      collection(db, "users", user.uid, "workoutPlans"),
-      {
-        createdAt: serverTimestamp(),
-        plan: plan.plan,
-        source: "ai",
+    const triggerAgentPlanRefresh = async () => {
+      if (!user) {
+        alert("User not logged in");
+        return;
       }
-    );
 
-    // ✅ OPTIONAL CACHE
-    localStorage.setItem("workoutPlan", JSON.stringify(plan));
+      const res = await fetch("http://127.0.0.1:8000/agent/run", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          user_id: user.uid,
+          message: "Generate or update my workout and nutrition plans",
+          mode: "plan",
+          autonomous: true,
+          context: {},
+        }),
+      });
 
-    navigate("/workouts");
-  } catch (err) {
-    console.error(err);
-    alert("Failed to generate workout plan");
-  }
-};
-
-  const handleNutritionClick = async () => {
-  if (!user) {
-    alert("User not logged in");
-    return;
-  }
-
-  try {
-    const res = await fetch("http://localhost:8000/nutrition/generate", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        goal: "general health",
-        diet: "vegetarian",
-        activity: "moderate",
-        allergies: "none",
-      }),
-    });
-
-    const plan = await res.json();
-
-    if (!plan.plan) throw new Error("Invalid nutrition plan");
-
-    // 🔥 Save to Firestore
-    await addDoc(
-      collection(db, "users", user.uid, "nutritionPlans"),
-      {
-        createdAt: serverTimestamp(),
-        plan: plan.plan,
-        source: "ai",
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data?.detail || data?.message || "Agent plan refresh failed");
       }
-    );
 
-    // Optional cache
-    localStorage.setItem("nutritionPlan", JSON.stringify(plan));
+      return data;
+    };
 
-    navigate("/nutrition");
+    const handleWorkoutClick = async () => {
+      try {
+        await triggerAgentPlanRefresh();
+        navigate("/workouts");
+      } catch (e) {
+        console.error(e);
+        alert(e?.message || "Failed to refresh workout plan with agent");
+      }
+    };
 
-  } catch (err) {
-    console.error(err);
-    alert("Failed to generate nutrition plan");
-  }
-};
+    const handleNutritionClick = async () => {
+      try {
+        await triggerAgentPlanRefresh();
+        navigate("/nutrition");
+      } catch (e) {
+        console.error(e);
+        alert(e?.message || "Failed to refresh nutrition plan with agent");
+      }
+    };
 
 
   // 1) Always know if user is logged in
