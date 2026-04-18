@@ -56,21 +56,21 @@ def _try_chat_completion(system_prompt: str, user_prompt: str, temperature: floa
     raise RuntimeError(f"Groq completion failed for all models: {last_error}")
 
 
-def generate_ai_response(prompt: str):
+def generate_ai_response(prompt: str, system_prompt: str | None = None):
     print("🔑 GROQ KEY: loaded")
 
     return _try_chat_completion(
-        system_prompt="You are a certified fitness coach. Respond only in valid JSON.",
+        system_prompt=system_prompt or "You are a certified fitness coach. Respond only in valid JSON.",
         user_prompt=prompt,
         temperature=0.6,
         max_tokens=700,
     )
 
 
-def generate_ai_text_response(prompt: str):
+def generate_ai_text_response(prompt: str, system_prompt: str | None = None):
     print("🔑 GROQ KEY: loaded")
     return _try_chat_completion(
-        system_prompt="You are Lifeline Coach. Reply in plain conversational text.",
+        system_prompt=system_prompt or "You are Lifeline Coach. Reply in plain conversational text.",
         user_prompt=prompt,
         temperature=0.6,
         max_tokens=700,

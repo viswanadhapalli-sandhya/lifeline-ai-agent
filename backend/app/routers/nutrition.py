@@ -157,6 +157,40 @@ def confirm_shopping_plan(request: NutritionShoppingConfirmRequest):
         merge=True,
     )
 
+    if status == "confirmed":
+        plan_items = current.get("items") if isinstance(current.get("items"), list) else []
+        if not plan_items:
+            cart_items = current.get("cart_items") if isinstance(current.get("cart_items"), list) else []
+            plan_items = [
+                str(item.get("item", "")).strip().lower()
+                for item in cart_items
+                if isinstance(item, dict) and str(item.get("item", "")).strip()
+            ]
+
+        pantry_ref = (
+            db.collection("users")
+            .document(request.user_id)
+            .collection("pantry")
+            .document("current")
+        )
+        pantry_snap = pantry_ref.get()
+        pantry_data = pantry_snap.to_dict() if pantry_snap.exists else {}
+
+        unavailable = pantry_data.get("unavailable_items") if isinstance(pantry_data.get("unavailable_items"), list) else []
+        unavailable_set = {str(x).strip().lower() for x in unavailable if str(x).strip()}
+
+        for item in plan_items:
+            key = str(item or "").strip().lower()
+            if not key:
+                continue
+            pantry_data[key] = True
+            if key in unavailable_set:
+                unavailable_set.remove(key)
+
+        pantry_data["unavailable_items"] = sorted(unavailable_set)
+        pantry_data["updatedAt"] = firestore.SERVER_TIMESTAMP
+        pantry_ref.set(pantry_data, merge=True)
+
     return {
         "ok": True,
         "shopping_plan_id": request.shopping_plan_id,
