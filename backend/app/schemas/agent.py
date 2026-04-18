@@ -24,6 +24,18 @@ class AgentUserRequest(BaseModel):
     user_id: str
 
 
+class AgentProactiveRunRequest(BaseModel):
+    slot: Literal["morning", "afternoon", "night"]
+    user_id: Optional[str] = None
+
+
+class AgentProactiveCleanupRequest(BaseModel):
+    user_id: Optional[str] = None
+    retention_days: Optional[int] = None
+    max_events_per_user: Optional[int] = None
+    dry_run: bool = False
+
+
 class AgentResponse(BaseModel):
     summary: str
     conversation_id: Optional[str] = None
