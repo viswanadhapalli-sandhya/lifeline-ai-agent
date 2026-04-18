@@ -1,7 +1,9 @@
 from app.core.groq_client import generate_ai_response
 from firebase_admin import firestore
 from app.core.firebase_client import db
+from app.services.simulation_service import simulate_outcome
 import json
+import re
 
 
 def _save_chat_history(user_id: str, user_message: str, assistant_payload: dict):
@@ -44,7 +46,29 @@ def normalize_ai_response(ai_response: str):
         "encouragement": encouragement,
     }
 
+
+def _is_what_if_query(message: str) -> bool:
+    text = str(message or "").strip().lower()
+    if not text:
+        return False
+    if "what if" in text or "what-if" in text:
+        return True
+    return bool(re.search(r"\b(if\s+i\s+(skip|miss))\b", text))
+
 def chat_with_user_context(user_id: str, message: str):
+    if _is_what_if_query(message):
+        simulation = simulate_outcome(user_id, message)
+        recovery = simulation.get("recovery_plan") if isinstance(simulation.get("recovery_plan"), list) else []
+        top_step = recovery[0] if recovery else "Restart with a light workout day."
+        normalized = {
+            "message": f"Simulation: {simulation.get('impact', 'impact unavailable')}. Next best step: {top_step}",
+            "suggestions": recovery[:3],
+            "encouragement": "This is a simulated forecast, not a fixed outcome. Small consistency actions can reduce the delay.",
+            "simulation": simulation,
+            "type": "simulation",
+        }
+        _save_chat_history(user_id=user_id, user_message=message, assistant_payload=normalized)
+        return normalized
 
     # 🔹 Fetch latest workout plan
     workout_docs = (

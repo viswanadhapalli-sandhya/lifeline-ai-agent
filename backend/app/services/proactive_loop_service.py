@@ -841,6 +841,17 @@ def _persist_autonomous_proactive_event(
             "priority": priority,
             "message": message,
             "why_this_action": why_this_action,
+            "decision_path": [
+                "autonomous-loop",
+                "proactive-recommendation",
+                f"action:{action}",
+            ],
+            "inputs_used": {
+                "priority": priority,
+                "dedupe_hash": dedupe_hash,
+                "progress_summary_present": bool(context_payload.get("progress_summary")),
+                "daily_log_count": len(context_payload.get("last_3_daily_logs") or []),
+            },
             "dedupe_hash": dedupe_hash,
             "summary": f"Proactive suggestion: {action}",
             "actions": ["proactive_suggestion_generated", action],

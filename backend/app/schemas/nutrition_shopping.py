@@ -14,6 +14,8 @@ class NutritionShoppingPlanRequest(BaseModel):
     unavailable_items: List[str] = Field(default_factory=list)
     available_items: List[str] = Field(default_factory=list)
     preferred_providers: List[str] = Field(default_factory=list)
+    city: str = ""
+    user_message: str = ""
 
 
 class NutritionShoppingConfirmRequest(BaseModel):
@@ -21,3 +23,24 @@ class NutritionShoppingConfirmRequest(BaseModel):
     shopping_plan_id: str
     provider: str
     action: Literal["place_order", "cancel"] = "place_order"
+
+
+class NutritionShoppingProgressRequest(BaseModel):
+    user_id: str
+    shopping_plan_id: str
+    items: List[str] = Field(default_factory=list)
+    added_items: List[str] = Field(default_factory=list)
+
+
+class NutritionShoppingUserRequest(BaseModel):
+    user_id: str
+
+
+class NutritionShoppingFollowupRequest(BaseModel):
+    user_id: str
+    shopping_plan_id: str
+
+
+class NutritionShoppingHealthcheckRequest(BaseModel):
+    user_id: str
+    shopping_plan_id: str = ""

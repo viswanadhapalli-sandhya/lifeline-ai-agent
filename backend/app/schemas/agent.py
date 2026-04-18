@@ -40,6 +40,7 @@ class AgentResponse(BaseModel):
     summary: str
     conversation_id: Optional[str] = None
     ai_reply: str = ""
+    confidence: float = 0.82
     actions: List[str] = Field(default_factory=list)
     nudges: List[str] = Field(default_factory=list)
     observed_state: Dict[str, Any] = Field(default_factory=dict)

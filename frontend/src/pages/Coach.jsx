@@ -95,6 +95,12 @@ export default function Coach() {
   const [hasAutoProactiveRun, setHasAutoProactiveRun] = useState(false);
   const [coachSuggestions, setCoachSuggestions] = useState([]);
 
+  const loadingMessage = proactiveLoading
+    ? "Analyzing your habits..."
+    : loading
+      ? "Adjusting your plan..."
+      : "";
+
   const formatSuggestionTime = (createdAt) => {
     if (!createdAt) return "";
     try {
@@ -163,14 +169,18 @@ export default function Coach() {
         (snap) => {
           const suggestions = snap.docs
             .map((d) => ({ id: d.id, ...(d.data() || {}) }))
-            .filter((event) => String(event.type || "").toLowerCase() === "proactive")
+            .filter((event) => {
+              const eventType = String(event.type || "").toLowerCase();
+              return eventType === "proactive" || eventType === "proactive_suggestion";
+            })
             .slice(0, 6)
             .map((event) => ({
               id: event.id,
               action: String(event.action || "general_coaching"),
               priority: String(event.priority || "medium").toLowerCase(),
               message: String(event.message || "").trim(),
-              why: String(event.why_this_action || "").trim(),
+              why: String(event.why_this_action || event.reason || "").trim(),
+              confidence: Number(event.confidence || event?.decision?.confidence || 0),
               createdAt: event.createdAt || null,
             }));
 
@@ -259,6 +269,7 @@ export default function Coach() {
               actions: payload.actions || [],
               nudges: payload.nudges || [],
               decision: payload.decision || {},
+              data: payload.data || {},
               progressSummary: payload.progress_summary || {},
               currentPlans: payload.current_plans || {},
               structuredLogs: payload.structured_logs || {},
@@ -373,6 +384,7 @@ export default function Coach() {
       setProactiveLoading(false);
     }
   };
+
 
   useEffect(() => {
     const user = auth.currentUser;
@@ -494,6 +506,10 @@ export default function Coach() {
               {proactiveLoading ? "Running Proactive Check..." : "Run Proactive Check"}
             </button>
           </div>
+
+          {loadingMessage && (
+            <div className="text-xs text-cyan-200/90">{loadingMessage}</div>
+          )}
         </div>
 
         {proactiveData && (
@@ -524,7 +540,10 @@ export default function Coach() {
                 {proactiveData.recommendations.map((rec, idx) => (
                   <div key={`${rec.type || "rec"}-${idx}`} className="rounded-md border border-emerald-700/30 bg-black/20 p-2 text-xs space-y-1">
                     <div className="font-semibold text-emerald-100">{rec.title} ({rec.priority})</div>
-                    <div className="text-emerald-200/80">{rec.reason}</div>
+                    <div className="text-emerald-200/80">Why this action: {rec.why_this_action || rec.reason}</div>
+                    {typeof rec.confidence === "number" && rec.confidence > 0 && (
+                      <div className="text-emerald-300/90">Confidence: {(rec.confidence * 100).toFixed(0)}%</div>
+                    )}
                     <div className="text-emerald-300">Try: {rec.suggested_message}</div>
                   </div>
                 ))}
@@ -577,7 +596,10 @@ export default function Coach() {
                     </div>
 
                     {item.message && <div className="text-cyan-100/95">{item.message}</div>}
-                    {item.why && <div className="text-cyan-200/80">Why: {item.why}</div>}
+                    {item.why && <div className="text-cyan-200/80">Why this action: {item.why}</div>}
+                    {item.confidence > 0 && (
+                      <div className="text-cyan-300/90">Confidence: {(item.confidence * 100).toFixed(0)}%</div>
+                    )}
 
                     <div className="text-[10px] text-cyan-100/60">
                       {formatSuggestionTime(item.createdAt) || "Just now"}
@@ -647,6 +669,29 @@ export default function Coach() {
         Why this action: {m.agent.decision.why_this_action}
       </div>
     )}
+
+    {m.role === "ai" && m.agent?.data?.simulation && (() => {
+      const sim = m.agent.data.simulation;
+      const recoveryPlan = Array.isArray(sim?.recovery_plan) ? sim.recovery_plan : [];
+
+      return (
+        <div className="text-xs rounded-md border border-cyan-500/30 bg-cyan-500/10 p-3 space-y-2">
+          <div className="text-cyan-100 font-semibold">What-if Simulation</div>
+          <div className="text-cyan-200/90">Impact: {String(sim?.impact || "unknown")}</div>
+          <div className="text-cyan-200/90">Streak loss risk: {sim?.streak_loss ? "Yes" : "No"}</div>
+          {recoveryPlan.length > 0 && (
+            <div>
+              <div className="text-cyan-100 mb-1">Recovery plan</div>
+              <ul className="list-disc list-inside text-cyan-200/90 space-y-1">
+                {recoveryPlan.map((step, idx) => (
+                  <li key={`${step}-${idx}`}>{String(step)}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
+      );
+    })()}
 
     {/* Agent internals */}
     {showTrace && m.role === "ai" && m.agent && (

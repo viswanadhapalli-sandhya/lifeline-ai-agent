@@ -12,6 +12,7 @@ from app.schemas.agent import AgentRequest, AgentResponse, AgentStep
 from app.services.nutrition_shopping_service import build_nutrition_shopping_plan
 from app.services.nutrition_service import generate_nutrition_plan
 from app.services.risk_engine import simple_risk_engine
+from app.services.simulation_service import simulate_outcome
 from app.services.workout_service import generate_workout_plan
 
 
@@ -374,9 +375,41 @@ def _refresh_progress_summary(user_id: str, logs: List[Dict[str, Any]] | None = 
 
 
 def _record_agent_event(user_id: str, payload: Dict[str, Any]) -> None:
+    event_payload = dict(payload or {})
+    decision = event_payload.get("decision") if isinstance(event_payload.get("decision"), dict) else {}
+    data = event_payload.get("data") if isinstance(event_payload.get("data"), dict) else {}
+    actions = event_payload.get("actions") if isinstance(event_payload.get("actions"), list) else []
+
+    if not isinstance(event_payload.get("decision_path"), list):
+        decision_path: List[str] = []
+        mode = str(event_payload.get("mode") or "").strip()
+        intent = str(event_payload.get("intent") or decision.get("intent") or "").strip()
+        if mode:
+            decision_path.append(f"mode:{mode}")
+        if intent:
+            decision_path.append(f"intent:{intent}")
+        for action in actions[:4]:
+            text = str(action or "").strip()
+            if text:
+                decision_path.append(f"action:{text}")
+        event_payload["decision_path"] = decision_path
+
+    if not isinstance(event_payload.get("inputs_used"), dict):
+        message = str(event_payload.get("message") or "").strip()
+        inputs_used: Dict[str, Any] = {
+            "data_keys": list(data.keys())[:12],
+            "action_count": len(actions),
+        }
+        if message:
+            inputs_used["message_preview"] = _clip_text(message, 140)
+        for key in ["why_this_action", "confidence", "travel_days", "disruption_type", "shopping_plan_id"]:
+            if key in decision:
+                inputs_used[key] = decision.get(key)
+        event_payload["inputs_used"] = inputs_used
+
     db.collection("users").document(user_id).collection("agentEvents").add(
         {
-            **payload,
+            **event_payload,
             "createdAt": firestore.SERVER_TIMESTAMP,
         }
     )
@@ -2187,6 +2220,8 @@ def get_proactive_recommendations(user_id: str, persist_event: bool = True) -> D
                 "priority": "high",
                 "title": "Send a quick daily check-in",
                 "reason": "No recent logs found in the last 48 hours.",
+                "why_this_action": "No recent behavior data was available, so a check-in restores adaptive coaching context.",
+                "confidence": 0.9,
                 "suggested_message": "I missed yesterday. Give me a short recovery plan for today.",
             }
         )
@@ -2198,6 +2233,8 @@ def get_proactive_recommendations(user_id: str, persist_event: bool = True) -> D
                 "priority": "high",
                 "title": "Improve meal logging consistency",
                 "reason": "Meal logs are low this week; tracking meals improves nutrition adaptation.",
+                "why_this_action": "Nutrition logging is a high-impact signal for meal plan adaptation.",
+                "confidence": 0.87,
                 "suggested_message": "Today I ate ... for breakfast/lunch/dinner.",
             }
         )
@@ -2209,6 +2246,8 @@ def get_proactive_recommendations(user_id: str, persist_event: bool = True) -> D
                 "priority": "medium",
                 "title": "Run a low-friction workout day",
                 "reason": "Workout frequency is low this week.",
+                "why_this_action": "Low workout frequency suggests momentum loss; a low-friction day improves adherence.",
+                "confidence": 0.82,
                 "suggested_message": "Give me a 20-minute easy workout to get back on track.",
             }
         )
@@ -2220,6 +2259,8 @@ def get_proactive_recommendations(user_id: str, persist_event: bool = True) -> D
                 "priority": "low",
                 "title": "Sync pantry and shopping items",
                 "reason": "No recent shopping confirmations detected.",
+                "why_this_action": "Shopping status impacts plan feasibility, so pantry sync reduces execution gaps.",
+                "confidence": 0.78,
                 "suggested_message": "I am missing these items: ...",
             }
         )
@@ -2240,6 +2281,7 @@ def get_proactive_recommendations(user_id: str, persist_event: bool = True) -> D
 
     return {
         "ok": True,
+        "confidence": 0.82,
         "metrics": metrics,
         "progress_summary": progress_summary,
         "trends_7d": trends_7d,
@@ -2550,11 +2592,32 @@ def is_today_plan_request(msg: str) -> bool:
     return any(phrase in msg for phrase in phrases)
 
 
+def detect_disruption_type(msg: str) -> str | None:
+    text = preprocess_message(msg)
+    if not text:
+        return None
+
+    fatigue_tokens = ["tired", "exhausted", "fatigue", "drained", "low energy", "burned out", "burnt out"]
+    busy_tokens = ["busy", "schedule", "packed", "no time", "deadline", "exam", "exams", "test week", "assignment"]
+    stress_tokens = ["stressed", "stress", "anxious", "overwhelmed", "pressure", "panic"]
+
+    if any(token in text for token in fatigue_tokens):
+        return "fatigue"
+    if any(token in text for token in busy_tokens):
+        return "busy"
+    if any(token in text for token in stress_tokens):
+        return "stress"
+    return None
+
+
 def detect_intent(message: str) -> str:
     msg = preprocess_message(message)
 
     if not msg:
         return "general_chat"
+
+    if _is_scenario_simulation_query(msg):
+        return "scenario_simulation"
 
     # Strict intent order (single-intent only):
     # 1) completion, 2) missing, 3) travel, 4) today plan, 5) progress, else general.
@@ -2563,6 +2626,9 @@ def detect_intent(message: str) -> str:
 
     if is_missing_ingredients(msg):
         return "missing_ingredients"
+
+    if detect_disruption_type(msg):
+        return "disruption_update"
 
     if "travel" in msg or "travelling" in msg:
         return "travel_update"
@@ -2574,6 +2640,17 @@ def detect_intent(message: str) -> str:
         return "progress_query"
 
     return "general_chat"
+
+
+def _is_scenario_simulation_query(msg: str) -> bool:
+    if not msg:
+        return False
+
+    if "what if" in msg or "what-if" in msg:
+        return True
+
+    simulation_tokens = ["if i skip", "if i miss", "hypothetical", "scenario", "simulate"]
+    return any(token in msg for token in simulation_tokens)
 
 
 def extract_items_from_message(message: str) -> List[str]:
@@ -2699,11 +2776,22 @@ def _mock_estimated_cost(items: List[str]) -> int:
 
 
 def _default_handler_payload(intent: str, response: str, why: str, data: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    confidence_by_intent = {
+        "completion_update": 0.93,
+        "missing_ingredients": 0.9,
+        "travel_update": 0.9,
+        "disruption_update": 0.88,
+        "today_plan_request": 0.95,
+        "progress_query": 0.95,
+        "general_chat": 0.72,
+    }
+
     return {
         "intent": intent,
         "response": response,
         "data": data or {},
         "why_this_action": why,
+        "confidence": confidence_by_intent.get(intent, 0.82),
     }
 
 
@@ -2931,6 +3019,131 @@ def _build_light_travel_workout_plan(base_plan: List[Dict[str, Any]], travel_day
     return {"plan": normalized}
 
 
+def _build_low_intensity_disruption_workout_plan(
+    base_plan: List[Dict[str, Any]],
+    disruption_type: str,
+    days: int = 5,
+) -> Dict[str, Any]:
+    normalized = _normalize_workout_plan(base_plan)
+    window = max(1, min(7, int(days)))
+
+    if disruption_type == "fatigue":
+        reason_tip = "Fatigue mode: keep movement easy and prioritize recovery sleep."
+    elif disruption_type == "busy":
+        reason_tip = "Busy mode: short sessions only; preserve consistency with low time cost."
+    else:
+        reason_tip = "Stress mode: reduce intensity and focus on calming movement."
+
+    for idx in range(window):
+        day = normalized[idx]
+        source_exercises = day.get("exercises") if isinstance(day.get("exercises"), list) else []
+        light_exercises: List[Dict[str, Any]] = []
+
+        for ex in source_exercises[:3]:
+            if isinstance(ex, dict):
+                light_exercises.append(
+                    {
+                        "name": str(ex.get("name") or "Bodyweight movement"),
+                        "sets": "2",
+                        "reps": "8-10",
+                        "rest": "60 sec",
+                    }
+                )
+            else:
+                light_exercises.append(
+                    {
+                        "name": str(ex),
+                        "sets": "2",
+                        "reps": "8-10",
+                        "rest": "60 sec",
+                    }
+                )
+
+        if not light_exercises:
+            light_exercises = [
+                {"name": "Brisk walk", "sets": "1", "reps": "15 min", "rest": "-"},
+                {"name": "Mobility flow", "sets": "1", "reps": "10 min", "rest": "-"},
+            ]
+
+        day["warmup"] = ["5-minute easy walk", "2-minute dynamic mobility"]
+        day["exercises"] = light_exercises
+        day["cooldown"] = ["5-minute breathing", "Light stretching"]
+        day["tip"] = reason_tip
+
+    return {"plan": normalized}
+
+
+def handle_disruption_update(uid: str, message: str) -> Dict[str, Any]:
+    disruption_type = detect_disruption_type(message) or "busy"
+    disruption_days = 5
+
+    profile = {**_fetch_user_profile(uid), **_fetch_latest_health_record(uid)}
+    goal = str(profile.get("goal") or "general fitness")
+
+    current_workout = _fetch_latest_plan(uid, "workoutPlans")
+    current_nutrition = _fetch_latest_plan(uid, "nutritionPlans")
+
+    base_workout_plan = current_workout.get("plan") if isinstance(current_workout.get("plan"), list) else []
+    if not base_workout_plan:
+        base_workout_plan = generate_workout_plan(_build_workout_input(profile, goal)).get("plan", [])
+
+    low_intensity_workout = _build_low_intensity_disruption_workout_plan(
+        base_workout_plan,
+        disruption_type=disruption_type,
+        days=disruption_days,
+    )
+
+    workout_doc_id = _save_plan_revision(
+        uid,
+        "workoutPlans",
+        "plan",
+        low_intensity_workout,
+        f"disruption_low_intensity_{disruption_type}",
+        goal,
+    )
+
+    nutrition_plan_id = current_nutrition.get("id")
+
+    _upsert_daily_log(
+        uid,
+        {
+            "disruption_active": True,
+            "disruption_type": disruption_type,
+            "disruption_days": disruption_days,
+            "adherence_status": "neutral",
+        },
+    )
+
+    _record_agent_event(
+        uid,
+        {
+            "type": "disruption",
+            "summary": f"Disruption detected: {disruption_type}",
+            "actions": ["disruption_detected", "plans_refreshed", "low_intensity_mode"],
+            "decision": {
+                "disruption_type": disruption_type,
+                "disruption_days": disruption_days,
+                "workout_plan_id": workout_doc_id,
+                "nutrition_plan_id": nutrition_plan_id,
+                "workload": "reduced",
+            },
+        },
+    )
+
+    return _default_handler_payload(
+        "disruption_update",
+        "Switching to lighter plan for 5 days.",
+        "Disruption keywords detected (fatigue/busy/stress); reduced workout load for continuity.",
+        {
+            "disruption_type": disruption_type,
+            "disruption_days": disruption_days,
+            "workload_mode": "low_intensity",
+            "workout_plan_id": workout_doc_id,
+            "nutrition_plan_id": nutrition_plan_id,
+        },
+    )
+
+
 def handle_travel_update(uid: str, message: str) -> Dict[str, Any]:
     travel_days = _extract_travel_days(message)
     if travel_days <= 0:
@@ -3079,6 +3292,30 @@ def handle_general_chat(uid: str, message: str) -> Dict[str, Any]:
     )
 
 
+def handle_scenario_simulation(uid: str, message: str) -> Dict[str, Any]:
+    simulation = simulate_outcome(uid, message)
+
+    impact = str(simulation.get("impact") or "impact unavailable")
+    streak_loss = bool(simulation.get("streak_loss", False))
+    recovery_plan = simulation.get("recovery_plan") if isinstance(simulation.get("recovery_plan"), list) else []
+    first_step = str(recovery_plan[0]) if recovery_plan else "Resume with a light day and rebuild gradually."
+
+    response = (
+        f"Simulation result: {impact}. "
+        f"Streak risk: {'high' if streak_loss else 'low'}. "
+        f"Suggested recovery: {first_step}"
+    )
+
+    return _default_handler_payload(
+        "scenario_simulation",
+        response,
+        "What-if phrasing detected; routed to deterministic outcome simulation using current stats and plans.",
+        {
+            "simulation": simulation,
+        },
+    )
+
+
 def run_agent_router(uid: str, message: str) -> Dict[str, Any]:
     intent = detect_intent(message)
     items = extract_items_from_message(message) if intent == "missing_ingredients" else None
@@ -3095,10 +3332,14 @@ def run_agent_router(uid: str, message: str) -> Dict[str, Any]:
         return handle_completion_update(uid, message)
     if intent == "today_plan_request":
         return handle_today_plan(uid)
+    if intent == "disruption_update":
+        return handle_disruption_update(uid, message)
     if intent == "travel_update":
         return handle_travel_update(uid, message)
     if intent == "progress_query":
         return handle_progress_query(uid)
+    if intent == "scenario_simulation":
+        return handle_scenario_simulation(uid, message)
     return handle_general_chat(uid, message)
 
 
@@ -3148,9 +3389,11 @@ def run_agent(request: AgentRequest) -> AgentResponse:
 
     actions.append(f"intent:{intent}")
     data = handler_payload.get("data") if isinstance(handler_payload.get("data"), dict) else {}
+    confidence = float(handler_payload.get("confidence") or 0.82)
     decision = {
         "intent": handler_payload.get("intent", intent),
         "why_this_action": handler_payload.get("why_this_action", "Deterministic route matched."),
+        "confidence": confidence,
     }
 
     summary = str(handler_payload.get("response") or "Response generated.").strip()[:160]
@@ -3166,6 +3409,7 @@ def run_agent(request: AgentRequest) -> AgentResponse:
         summary=summary,
         conversation_id=conversation_id,
         ai_reply=ai_reply,
+        confidence=confidence,
         actions=actions,
         nudges=[],
         observed_state={"intent": intent},
@@ -3188,6 +3432,8 @@ def run_agent(request: AgentRequest) -> AgentResponse:
             "ai_reply": ai_reply,
             "intent": intent,
             "type": "agent_router",
+            "confidence": confidence,
+            "why_this_action": decision.get("why_this_action"),
             "actions": actions,
             "decision": {
                 **decision,
@@ -3204,6 +3450,7 @@ def run_agent(request: AgentRequest) -> AgentResponse:
         ai_reply,
         payload={
             "summary": summary,
+            "confidence": confidence,
             "actions": actions,
             "decision": decision,
             "data": data,

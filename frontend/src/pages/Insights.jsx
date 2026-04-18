@@ -1,14 +1,16 @@
 import { useEffect, useState } from "react";
 import { onAuthStateChanged } from "firebase/auth";
+import { collection, limit, onSnapshot, orderBy, query } from "firebase/firestore";
 
 import TopNav from "../components/TopNav";
-import { auth } from "../services/firebase";
+import { auth, db } from "../services/firebase";
 import { postJSON } from "../services/api";
 
 export default function Insights() {
   const [loading, setLoading] = useState(true);
   const [metricsData, setMetricsData] = useState(null);
   const [proactiveData, setProactiveData] = useState(null);
+  const [agentEvents, setAgentEvents] = useState([]);
 
   const loadInsights = async (uid) => {
     setLoading(true);
@@ -38,6 +40,41 @@ export default function Insights() {
     });
 
     return () => unsub();
+  }, []);
+
+  useEffect(() => {
+    let unsubEvents = () => {};
+
+    const unsubAuth = onAuthStateChanged(auth, (user) => {
+      unsubEvents();
+
+      if (!user) {
+        setAgentEvents([]);
+        return;
+      }
+
+      const q = query(
+        collection(db, "users", user.uid, "agentEvents"),
+        orderBy("createdAt", "desc"),
+        limit(40)
+      );
+
+      unsubEvents = onSnapshot(
+        q,
+        (snap) => {
+          const events = snap.docs.map((d) => ({ id: d.id, ...(d.data() || {}) }));
+          setAgentEvents(events);
+        },
+        () => {
+          setAgentEvents([]);
+        }
+      );
+    });
+
+    return () => {
+      unsubEvents();
+      unsubAuth();
+    };
   }, []);
 
   if (loading) {
@@ -154,6 +191,65 @@ export default function Insights() {
             </div>
           ) : (
             <div className="text-sm text-zinc-400">No interventions needed right now.</div>
+          )}
+        </div>
+
+        <div className="rounded-xl border border-zinc-700 bg-zinc-900/60 p-4 space-y-3">
+          <div className="text-lg font-semibold">Agent Decision Timeline</div>
+
+          {agentEvents.length === 0 ? (
+            <div className="text-sm text-zinc-400">No agent events yet.</div>
+          ) : (
+            <div className="space-y-3">
+              {agentEvents.map((event) => {
+                const action = String(event.action || event.type || "agent_event").replaceAll("_", " ");
+                const summary = String(event.summary || event.message || "Event recorded").trim();
+                const why = String(
+                  event.why_this_action ||
+                    event?.decision?.why_this_action ||
+                    event?.decision?.reason ||
+                    "No explicit reason recorded"
+                ).trim();
+                const decisionPath = Array.isArray(event.decision_path)
+                  ? event.decision_path
+                  : [];
+                const inputsUsed = event.inputs_used && typeof event.inputs_used === "object"
+                  ? event.inputs_used
+                  : null;
+                const ts =
+                  typeof event?.createdAt?.toDate === "function"
+                    ? event.createdAt.toDate().toLocaleString()
+                    : "";
+
+                return (
+                  <div key={event.id} className="rounded-md border border-zinc-700 bg-zinc-950 p-3 text-sm space-y-2">
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <div className="font-semibold text-emerald-200">Trigger: {action}</div>
+                        <div className="text-zinc-300 mt-1">{summary}</div>
+                      </div>
+                      {ts && <div className="text-xs text-zinc-500">{ts}</div>}
+                    </div>
+
+                    <div className="text-zinc-300">
+                      <span className="text-zinc-400">Why decision was made:</span> {why}
+                    </div>
+
+                    {decisionPath.length > 0 && (
+                      <div className="text-xs text-cyan-200/90">
+                        Decision path: {decisionPath.join(" -> ")}
+                      </div>
+                    )}
+
+                    {inputsUsed && (
+                      <div className="text-xs text-zinc-400 rounded-md border border-zinc-700 bg-zinc-900/70 p-2 overflow-x-auto">
+                        Inputs used: {JSON.stringify(inputsUsed)}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
           )}
         </div>
       </div>
