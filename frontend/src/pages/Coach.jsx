@@ -93,6 +93,22 @@ export default function Coach() {
   const [proactiveLoading, setProactiveLoading] = useState(false);
   const [proactiveData, setProactiveData] = useState(null);
   const [hasAutoProactiveRun, setHasAutoProactiveRun] = useState(false);
+  const [coachSuggestions, setCoachSuggestions] = useState([]);
+
+  const formatSuggestionTime = (createdAt) => {
+    if (!createdAt) return "";
+    try {
+      if (typeof createdAt?.toDate === "function") {
+        return createdAt.toDate().toLocaleString();
+      }
+      if (createdAt instanceof Date) {
+        return createdAt.toLocaleString();
+      }
+    } catch {
+      return "";
+    }
+    return "";
+  };
 
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, async (user) => {
@@ -123,6 +139,53 @@ export default function Coach() {
     });
 
     return () => unsub();
+  }, []);
+
+  useEffect(() => {
+    let unsubSuggestions = () => {};
+
+    const unsubAuth = onAuthStateChanged(auth, (user) => {
+      unsubSuggestions();
+
+      if (!user) {
+        setCoachSuggestions([]);
+        return;
+      }
+
+      const proactiveEventsQ = query(
+        collection(db, "users", user.uid, "agentEvents"),
+        orderBy("createdAt", "desc"),
+        limit(30)
+      );
+
+      unsubSuggestions = onSnapshot(
+        proactiveEventsQ,
+        (snap) => {
+          const suggestions = snap.docs
+            .map((d) => ({ id: d.id, ...(d.data() || {}) }))
+            .filter((event) => String(event.type || "").toLowerCase() === "proactive")
+            .slice(0, 6)
+            .map((event) => ({
+              id: event.id,
+              action: String(event.action || "general_coaching"),
+              priority: String(event.priority || "medium").toLowerCase(),
+              message: String(event.message || "").trim(),
+              why: String(event.why_this_action || "").trim(),
+              createdAt: event.createdAt || null,
+            }));
+
+          setCoachSuggestions(suggestions);
+        },
+        () => {
+          setCoachSuggestions([]);
+        }
+      );
+    });
+
+    return () => {
+      unsubSuggestions();
+      unsubAuth();
+    };
   }, []);
 
   useEffect(() => {
@@ -488,6 +551,43 @@ export default function Coach() {
             )}
           </div>
         )}
+
+        <div className="mb-4 p-3 rounded-xl border border-cyan-700/40 bg-cyan-950/20 space-y-3">
+          <div className="text-sm font-semibold text-cyan-200">Coach Suggestions</div>
+
+          {coachSuggestions.length === 0 ? (
+            <div className="text-xs text-cyan-100/70">
+              No proactive suggestions yet. The autonomous coach loop will populate this as new interventions are generated.
+            </div>
+          ) : (
+            <div className="space-y-2">
+              {coachSuggestions.map((item) => {
+                const isHigh = item.priority === "high";
+                const toneClass = isHigh
+                  ? "border-rose-400/60 bg-rose-500/10"
+                  : "border-cyan-700/30 bg-black/20";
+
+                return (
+                  <div key={item.id} className={`rounded-md border p-2 text-xs space-y-1 ${toneClass}`}>
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="font-semibold text-cyan-100">{item.action.replaceAll("_", " ")}</div>
+                      <div className={`uppercase tracking-wide ${isHigh ? "text-rose-200" : "text-cyan-200/90"}`}>
+                        {item.priority}
+                      </div>
+                    </div>
+
+                    {item.message && <div className="text-cyan-100/95">{item.message}</div>}
+                    {item.why && <div className="text-cyan-200/80">Why: {item.why}</div>}
+
+                    <div className="text-[10px] text-cyan-100/60">
+                      {formatSuggestionTime(item.createdAt) || "Just now"}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
 
         {resolvedProgressSummary && (
           <div className="mb-4 p-3 rounded-xl border border-zinc-700 bg-zinc-900/70 space-y-2">

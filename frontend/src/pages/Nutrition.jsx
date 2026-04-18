@@ -21,6 +21,9 @@ export default function Nutrition() {
   const [shoppingLoading, setShoppingLoading] = useState(false);
   const [confirmLoading, setConfirmLoading] = useState(false);
   const [shoppingPlan, setShoppingPlan] = useState(null);
+  const [unavailableItems, setUnavailableItems] = useState([]);
+
+  const uid = auth.currentUser?.uid || null;
 
   useEffect(() => {
     const user = auth.currentUser;
@@ -94,6 +97,35 @@ export default function Nutrition() {
       unsubProgress();
     };
   }, []);
+
+  useEffect(() => {
+    if (!uid) {
+      setUnavailableItems([]);
+      return () => {};
+    }
+
+    const ref = doc(db, "users", uid, "pantry", "current");
+
+    const unsubscribe = onSnapshot(ref, (docSnap) => {
+      if (docSnap.exists()) {
+        const data = docSnap.data() || {};
+
+        const unavailable = Object.keys(data)
+          .filter((item) => data[item] === false)
+          .map((item) => item.toLowerCase().trim())
+          .filter(Boolean)
+          .sort();
+
+        setUnavailableItems(unavailable);
+        setUnavailableInput(unavailable.join(", "));
+      } else {
+        setUnavailableItems([]);
+        setUnavailableInput("");
+      }
+    });
+
+    return () => unsubscribe();
+  }, [uid]);
 
   const totalWorkoutDays = Number(progressSummary?.total_workout_days || 0);
   const completedDaysInCurrentCycle = totalWorkoutDays % 7;
