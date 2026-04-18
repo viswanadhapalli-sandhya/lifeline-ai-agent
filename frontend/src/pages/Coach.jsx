@@ -159,6 +159,7 @@ export default function Coach() {
               actions: payload.actions || [],
               nudges: payload.nudges || [],
               decision: payload.decision || {},
+              progressSummary: payload.progress_summary || {},
               currentPlans: payload.current_plans || {},
               structuredLogs: payload.structured_logs || {},
               planUpdates: payload.plan_updates || {},
@@ -244,9 +245,32 @@ export default function Coach() {
     await callAgent(text, mode);
   };
 
+  const handleInputKeyDown = (e) => {
+    if (e.key !== "Enter" || e.shiftKey) return;
+    e.preventDefault();
+    if (!loading) {
+      void sendMessage();
+    }
+  };
+
   const runModeWithoutMessage = async (selectedMode) => {
     await callAgent("", selectedMode);
   };
+
+  const latestProgressSummary = (() => {
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      const msg = messages[i];
+      const summary = msg?.agent?.progressSummary;
+      if (summary && Object.keys(summary).length > 0) {
+        return summary;
+      }
+    }
+    return null;
+  })();
+
+  const progressWorkoutDays = Number(latestProgressSummary?.total_workout_days || 0);
+  const currentCycleWeek = Math.floor(progressWorkoutDays / 7) + 1;
+  const currentCycleDay = (progressWorkoutDays % 7) + 1;
 
   return (
     <div className="min-h-screen bg-black text-white">
@@ -334,6 +358,46 @@ export default function Coach() {
             </button>
           </div>
         </div>
+
+        {latestProgressSummary && (
+          <div className="mb-4 p-3 rounded-xl border border-zinc-700 bg-zinc-900/70 space-y-2">
+            <div className="text-sm font-semibold text-zinc-200">Progress Summary</div>
+            <div className="grid grid-cols-2 md:grid-cols-5 gap-2 text-xs">
+              <div className="rounded-md border border-zinc-700 bg-zinc-800/60 p-2">
+                <div className="text-zinc-400">Current Target</div>
+                <div className="text-zinc-100 font-semibold">Week {currentCycleWeek} Day {currentCycleDay}</div>
+              </div>
+              <div className="rounded-md border border-zinc-700 bg-zinc-800/60 p-2">
+                <div className="text-zinc-400">Workout Days</div>
+                <div className="text-zinc-100 font-semibold">{latestProgressSummary.total_workout_days || 0}</div>
+              </div>
+              <div className="rounded-md border border-zinc-700 bg-zinc-800/60 p-2">
+                <div className="text-zinc-400">Meal-log Days</div>
+                <div className="text-zinc-100 font-semibold">{latestProgressSummary.total_meal_log_days || 0}</div>
+              </div>
+              <div className="rounded-md border border-zinc-700 bg-zinc-800/60 p-2">
+                <div className="text-zinc-400">Total Logs</div>
+                <div className="text-zinc-100 font-semibold">{latestProgressSummary.total_daily_logs || 0}</div>
+              </div>
+              <div className="rounded-md border border-zinc-700 bg-zinc-800/60 p-2">
+                <div className="text-zinc-400">Workout Minutes</div>
+                <div className="text-zinc-100 font-semibold">{latestProgressSummary.total_workout_minutes || 0}</div>
+              </div>
+            </div>
+
+            {Array.isArray(latestProgressSummary.recent_workout_history) &&
+              latestProgressSummary.recent_workout_history.length > 0 && (
+                <div className="text-xs text-zinc-300 rounded-md border border-zinc-700 bg-zinc-800/40 p-2">
+                  <div className="font-semibold text-zinc-200 mb-1">Recent Workout History</div>
+                  {latestProgressSummary.recent_workout_history.slice(0, 5).map((entry, idx) => (
+                    <div key={`${entry.date || "unknown"}-${idx}`}>
+                      {(entry.date || "unknown")}: {entry.workout_minutes || 0} min
+                    </div>
+                  ))}
+                </div>
+              )}
+          </div>
+        )}
 
         <div className="space-y-3 mb-4">
           {messages.map((m, i) => (
@@ -462,6 +526,7 @@ export default function Coach() {
           <input
             value={input}
             onChange={(e) => setInput(e.target.value)}
+            onKeyDown={handleInputKeyDown}
             className="flex-1 p-2 rounded-lg bg-zinc-900 border border-zinc-700"
             placeholder="Log your day, ask for plan changes, or request reflection..."
           />

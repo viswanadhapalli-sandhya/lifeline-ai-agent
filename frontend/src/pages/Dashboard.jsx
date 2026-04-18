@@ -23,10 +23,38 @@ export default function Dashboard() {
   const [loadingData, setLoadingData] = useState(false);
   const [records, setRecords] = useState([]);
   const [err, setErr] = useState("");
-    const triggerAgentPlanRefresh = async () => {
+    const hasExistingPlans = async () => {
+      if (!user) return false;
+
+      const workoutSnap = await getDocs(
+        query(
+          collection(db, "users", user.uid, "workoutPlans"),
+          orderBy("createdAt", "desc"),
+          limit(1)
+        )
+      );
+      const nutritionSnap = await getDocs(
+        query(
+          collection(db, "users", user.uid, "nutritionPlans"),
+          orderBy("createdAt", "desc"),
+          limit(1)
+        )
+      );
+
+      return !workoutSnap.empty && !nutritionSnap.empty;
+    };
+
+    const triggerAgentPlanRefresh = async ({ force = false } = {}) => {
       if (!user) {
         alert("User not logged in");
         return;
+      }
+
+      if (!force) {
+        const alreadyGenerated = await hasExistingPlans();
+        if (alreadyGenerated) {
+          return { skipped: true };
+        }
       }
 
       const res = await fetch("http://127.0.0.1:8000/agent/run", {

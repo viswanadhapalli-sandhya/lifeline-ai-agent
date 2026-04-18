@@ -2,6 +2,19 @@ from app.core.groq_client import generate_ai_response
 from firebase_admin import firestore
 from app.core.firebase_client import db
 import json
+
+
+def _save_chat_history(user_id: str, user_message: str, assistant_payload: dict):
+    db.collection("users").document(user_id).collection("chatHistory").add(
+        {
+            "message": user_message,
+            "assistant": assistant_payload,
+            "createdAt": firestore.SERVER_TIMESTAMP,
+            "source": "chat_endpoint",
+        }
+    )
+
+
 def normalize_ai_response(ai_response: str):
     try:
         cleaned = ai_response.replace("```json", "").replace("```", "").strip()
@@ -93,6 +106,8 @@ Rules:
     # If model returns JSON, parse it safely
     
     normalized = normalize_ai_response(ai_response)
+
+    _save_chat_history(user_id=user_id, user_message=message, assistant_payload=normalized)
 
     return normalized
 

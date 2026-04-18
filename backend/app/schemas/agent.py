@@ -29,6 +29,7 @@ class AgentResponse(BaseModel):
     observed_state: Dict[str, Any] = Field(default_factory=dict)
     decision: Dict[str, Any] = Field(default_factory=dict)
     current_plans: Dict[str, Any] = Field(default_factory=dict)
+    progress_summary: Dict[str, Any] = Field(default_factory=dict)
     structured_logs: Dict[str, Any] = Field(default_factory=dict)
     plan_updates: Dict[str, Any] = Field(default_factory=dict)
     weekly_reflection: Dict[str, Any] = Field(default_factory=dict)

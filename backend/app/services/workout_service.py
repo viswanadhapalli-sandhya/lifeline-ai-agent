@@ -123,6 +123,66 @@ Return JSON in this EXACT format:
 """
 
 
+def build_weekly_workout_prompt(data):
+        return f"""
+Generate a complete 7-day workout plan.
+Respond in STRICT JSON only.
+No markdown. No explanations.
+
+User details:
+- Goal: {data.goal}
+- Location: {data.location}
+- Time per day: {data.time_per_day} minutes
+- Fitness level: {data.fitness_level}
+- Equipment: {data.equipment or "none"}
+
+Return JSON in this EXACT format:
+{{
+    "plan": [
+        {{
+            "day": "Day 1",
+            "warmup": ["..."],
+            "exercises": [
+                {{
+                    "name": "",
+                    "sets": 0,
+                    "reps": "",
+                    "rest": ""
+                }}
+            ],
+            "cooldown": ["..."],
+            "tip": ""
+        }}
+    ]
+}}
+"""
+
+
+def _normalize_weekly_workout_payload(payload):
+        plan = payload.get("plan") if isinstance(payload, dict) else None
+        if not isinstance(plan, list) or not plan:
+                return None
+
+        normalized = []
+        for idx, day in enumerate(plan[:7], start=1):
+                if not isinstance(day, dict):
+                        continue
+                normalized.append(
+                        {
+                                "day": str(day.get("day") or f"Day {idx}"),
+                                "warmup": day.get("warmup") if isinstance(day.get("warmup"), list) else ["5 min walking"],
+                                "exercises": day.get("exercises") if isinstance(day.get("exercises"), list) else [],
+                                "cooldown": day.get("cooldown") if isinstance(day.get("cooldown"), list) else ["Light stretching"],
+                                "tip": str(day.get("tip") or "Consistency matters more than intensity."),
+                        }
+                )
+
+        if len(normalized) < 7:
+                return None
+
+        return {"plan": normalized}
+
+
 
 # --------------------------------------------------
 # GENERATE FULL 7-DAY WORKOUT PLAN
@@ -130,6 +190,18 @@ Return JSON in this EXACT format:
 
 def generate_workout_plan(data):
     print("🔥 NEW WORKOUT SERVICE RUNNING 🔥")
+
+    try:
+        weekly_prompt = build_weekly_workout_prompt(data)
+        weekly_response = generate_ai_response(weekly_prompt).strip()
+        if weekly_response.startswith("```"):
+            weekly_response = weekly_response.replace("```json", "").replace("```", "").strip()
+
+        weekly_payload = _normalize_weekly_workout_payload(json.loads(weekly_response))
+        if weekly_payload:
+            return weekly_payload
+    except Exception as e:
+        print("⚠️ WEEKLY WORKOUT FAST PATH FAILED:", e)
 
     weekly_plan = []
 

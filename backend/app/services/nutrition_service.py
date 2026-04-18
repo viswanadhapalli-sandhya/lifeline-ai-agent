@@ -39,8 +39,78 @@ Return JSON in this EXACT format:
 }}
 """
 
+
+def build_weekly_nutrition_prompt(data):
+    return f"""
+You are a certified Indian nutritionist.
+
+Generate a complete 7-day INDIAN diet plan.
+Use common Indian household foods only.
+Avoid western dishes.
+Respond in STRICT JSON only.
+No markdown. No explanations.
+
+User details:
+- Goal: {data.goal}
+- Dietary preference: {data.diet}
+- Activity level: {data.activity}
+- Allergies: {data.allergies or "none"}
+
+Return JSON in this EXACT format:
+{{
+  "plan": [
+    {{
+      "day": "Day 1",
+      "breakfast": ["..."],
+      "lunch": ["..."],
+      "snacks": ["..."],
+      "dinner": ["..."],
+      "tip": ""
+    }}
+  ]
+}}
+"""
+
+
+def _normalize_weekly_nutrition_payload(payload):
+    plan = payload.get("plan") if isinstance(payload, dict) else None
+    if not isinstance(plan, list) or not plan:
+        return None
+
+    normalized = []
+    for idx, day in enumerate(plan[:7], start=1):
+        if not isinstance(day, dict):
+            continue
+        normalized.append(
+            {
+                "day": str(day.get("day") or f"Day {idx}"),
+                "breakfast": day.get("breakfast") if isinstance(day.get("breakfast"), list) else ["Vegetable oats / idli"],
+                "lunch": day.get("lunch") if isinstance(day.get("lunch"), list) else ["Rice, dal, seasonal vegetables"],
+                "snacks": day.get("snacks") if isinstance(day.get("snacks"), list) else ["Fruit or roasted chana"],
+                "dinner": day.get("dinner") if isinstance(day.get("dinner"), list) else ["Chapati with sabzi"],
+                "tip": str(day.get("tip") or "Eat mindfully and stay hydrated."),
+            }
+        )
+
+    if len(normalized) < 7:
+        return None
+
+    return {"plan": normalized}
+
 def generate_nutrition_plan(data):
     print("🥗 NEW NUTRITION SERVICE RUNNING 🥗")
+
+    try:
+        weekly_prompt = build_weekly_nutrition_prompt(data)
+        weekly_response = generate_ai_response(weekly_prompt).strip()
+        if weekly_response.startswith("```"):
+            weekly_response = weekly_response.replace("```json", "").replace("```", "").strip()
+
+        weekly_payload = _normalize_weekly_nutrition_payload(safe_json_loads(weekly_response))
+        if weekly_payload:
+            return weekly_payload
+    except Exception as e:
+        print("⚠️ WEEKLY NUTRITION FAST PATH FAILED:", e)
 
     weekly_plan = []
 

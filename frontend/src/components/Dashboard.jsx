@@ -1,6 +1,7 @@
 import { useMemo } from "react";
 import { useNavigate } from "react-router-dom";
 import TopNav from "../components/TopNav";
+import { auth } from "../services/firebase";
 
 export default function Dashboard() {
   <h1>🔥 DASHBOARD LOADED 🔥</h1>
@@ -16,6 +17,12 @@ export default function Dashboard() {
   }, []);
 
 async function handleWorkoutClick() {
+  const user = auth.currentUser;
+  if (!user) {
+    alert("Please log in first.");
+    return;
+  }
+
   // 1️⃣ If workout already exists, just show it
   console.log("Workout card clicked"); // 👈 ADD THIS
   const existing = localStorage.getItem("workoutPlan");
@@ -42,6 +49,7 @@ async function handleWorkoutClick() {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
+      user_id: user.uid,
       goal,
       location: "home",
       time_per_day,

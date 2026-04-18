@@ -1,7 +1,24 @@
 import { Link, useLocation } from "react-router-dom";
+import { signOut } from "firebase/auth";
+import { auth } from "../services/firebase";
 
 export default function TopNav({ rightText = "Logout", onRightClick }) {
   const { pathname } = useLocation();
+
+  const handleRightClick = async () => {
+    if (typeof onRightClick === "function") {
+      onRightClick();
+      return;
+    }
+
+    try {
+      await signOut(auth);
+    } catch (e) {
+      console.error("Logout failed", e);
+    }
+
+    window.location.href = "/";
+  };
 
   const navItem = (to, label) => {
     const active = pathname === to;
@@ -38,7 +55,7 @@ export default function TopNav({ rightText = "Logout", onRightClick }) {
           {navItem("/coach", "AI Coach")}
 
           <button
-            onClick={onRightClick}
+            onClick={handleRightClick}
             className="ml-2 px-3 py-2 rounded-xl text-sm font-semibold bg-white/10 hover:bg-white/15 border border-white/10 text-white"
           >
             {rightText}
