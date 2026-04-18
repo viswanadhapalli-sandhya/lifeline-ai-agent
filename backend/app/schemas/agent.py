@@ -20,6 +20,10 @@ class AgentStep(BaseModel):
     output: Dict[str, Any] = Field(default_factory=dict)
 
 
+class AgentUserRequest(BaseModel):
+    user_id: str
+
+
 class AgentResponse(BaseModel):
     summary: str
     conversation_id: Optional[str] = None

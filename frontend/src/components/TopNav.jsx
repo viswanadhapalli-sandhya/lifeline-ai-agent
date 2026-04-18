@@ -53,6 +53,7 @@ export default function TopNav({ rightText = "Logout", onRightClick }) {
           {navItem("/workouts", "Workouts")}
           {navItem("/nutrition", "Nutrition")}
           {navItem("/coach", "AI Coach")}
+          {navItem("/insights", "Insights")}
 
           <button
             onClick={handleRightClick}

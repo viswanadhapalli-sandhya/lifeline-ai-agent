@@ -1604,6 +1604,239 @@ def _count_meal_logged_days(logs: List[Dict[str, Any]]) -> int:
     return count
 
 
+def _parse_date_key(raw: str) -> date | None:
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        return datetime.strptime(raw.strip(), "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+
+def _compute_activity_streak(logs: List[Dict[str, Any]]) -> int:
+    dated_logs: Dict[date, Dict[str, Any]] = {}
+    for item in logs:
+        d = _parse_date_key(item.get("date"))
+        if d is None:
+            continue
+        dated_logs[d] = item
+
+    if not dated_logs:
+        return 0
+
+    streak = 0
+    cursor = _utc_now().date()
+    while True:
+        current = dated_logs.get(cursor)
+        if not current:
+            break
+
+        minutes = current.get("workout_minutes", 0)
+        worked = bool(current.get("workout_completed", False)) or (isinstance(minutes, (int, float)) and int(minutes) > 0)
+        meal = bool(current.get("meal_logged", False)) or bool((current.get("meal_text") or "").strip())
+        if not (worked or meal):
+            break
+
+        streak += 1
+        cursor = cursor - timedelta(days=1)
+
+    return streak
+
+
+def _build_7d_trends(logs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    by_date: Dict[date, Dict[str, Any]] = {}
+    for item in logs:
+        d = _parse_date_key(item.get("date"))
+        if d is None:
+            continue
+        by_date[d] = item
+
+    today = _utc_now().date()
+    start = today - timedelta(days=6)
+    trends: List[Dict[str, Any]] = []
+
+    for offset in range(7):
+        d = start + timedelta(days=offset)
+        item = by_date.get(d, {})
+        minutes = item.get("workout_minutes", 0)
+        workout_completed = bool(item.get("workout_completed", False)) or (isinstance(minutes, (int, float)) and int(minutes) > 0)
+        meal_logged = bool(item.get("meal_logged", False)) or bool((item.get("meal_text") or "").strip())
+
+        trends.append(
+            {
+                "date": d.strftime("%Y-%m-%d"),
+                "workout_completed": workout_completed,
+                "meal_logged": meal_logged,
+                "workout_minutes": int(minutes) if isinstance(minutes, (int, float)) and int(minutes) > 0 else 0,
+            }
+        )
+
+    return trends
+
+
+def _fetch_recent_agent_events(user_id: str, max_entries: int = 300) -> List[Dict[str, Any]]:
+    docs = (
+        db.collection("users")
+        .document(user_id)
+        .collection("agentEvents")
+        .order_by("createdAt", direction=firestore.Query.DESCENDING)
+        .limit(max_entries)
+        .get()
+    )
+    return [doc.to_dict() or {} for doc in docs]
+
+
+def _fetch_recent_shopping_plans(user_id: str, max_entries: int = 100) -> List[Dict[str, Any]]:
+    docs = (
+        db.collection("users")
+        .document(user_id)
+        .collection("nutritionShoppingPlans")
+        .order_by("createdAt", direction=firestore.Query.DESCENDING)
+        .limit(max_entries)
+        .get()
+    )
+    return [doc.to_dict() or {} for doc in docs]
+
+
+def get_agent_metrics(user_id: str) -> Dict[str, Any]:
+    all_logs = _fetch_all_daily_logs(user_id)
+    progress_summary = _refresh_progress_summary(user_id, logs=all_logs)
+    trends_7d = _build_7d_trends(all_logs)
+
+    today = _utc_now().date()
+    last_7_start = today - timedelta(days=6)
+
+    logs_7d: List[Dict[str, Any]] = []
+    for item in all_logs:
+        d = _parse_date_key(item.get("date"))
+        if d is None:
+            continue
+        if d < last_7_start or d > today:
+            continue
+        logs_7d.append(item)
+
+    workout_days_7d = _count_workout_days(logs_7d)
+    meal_days_7d = _count_meal_logged_days(logs_7d)
+    logs_present_7d = len({item.get("date") for item in logs_7d if isinstance(item.get("date"), str)})
+
+    events = _fetch_recent_agent_events(user_id)
+    plan_refreshes_7d = 0
+    for event in events:
+        created = event.get("createdAt")
+        created_date = created.date() if hasattr(created, "date") else None
+        if created_date and created_date < last_7_start:
+            continue
+        actions = event.get("actions") if isinstance(event.get("actions"), list) else []
+        if "plans_refreshed" in actions:
+            plan_refreshes_7d += 1
+
+    shopping_plans = _fetch_recent_shopping_plans(user_id)
+    confirmations_7d = 0
+    for item in shopping_plans:
+        confirmed_at = item.get("confirmedAt")
+        confirmed_date = confirmed_at.date() if hasattr(confirmed_at, "date") else None
+        if confirmed_date is None or confirmed_date < last_7_start:
+            continue
+        if str(item.get("status", "")).lower() == "confirmed":
+            confirmations_7d += 1
+
+    streak = _compute_activity_streak(all_logs)
+    adherence_7d = round((workout_days_7d + meal_days_7d) / 14.0, 2)
+
+    return {
+        "progress_summary": progress_summary,
+        "metrics": {
+            "active_streak_days": streak,
+            "adherence_rate_7d": adherence_7d,
+            "workout_days_7d": workout_days_7d,
+            "meal_log_days_7d": meal_days_7d,
+            "days_with_any_log_7d": logs_present_7d,
+            "plan_refreshes_7d": plan_refreshes_7d,
+            "shopping_confirmations_7d": confirmations_7d,
+        },
+        "trends_7d": trends_7d,
+    }
+
+
+def get_proactive_recommendations(user_id: str) -> Dict[str, Any]:
+    all_logs = _fetch_all_daily_logs(user_id)
+    metrics_payload = get_agent_metrics(user_id)
+    metrics = metrics_payload.get("metrics", {})
+    progress_summary = metrics_payload.get("progress_summary", {})
+    trends_7d = metrics_payload.get("trends_7d", [])
+
+    recommendations: List[Dict[str, Any]] = []
+
+    latest_date = None
+    if all_logs:
+        latest_date = _parse_date_key(all_logs[0].get("date"))
+
+    if latest_date is None or (_utc_now().date() - latest_date).days >= 2:
+        recommendations.append(
+            {
+                "type": "checkin",
+                "priority": "high",
+                "title": "Send a quick daily check-in",
+                "reason": "No recent logs found in the last 48 hours.",
+                "suggested_message": "I missed yesterday. Give me a short recovery plan for today.",
+            }
+        )
+
+    if int(metrics.get("meal_log_days_7d", 0)) <= 2:
+        recommendations.append(
+            {
+                "type": "nutrition_logging",
+                "priority": "high",
+                "title": "Improve meal logging consistency",
+                "reason": "Meal logs are low this week; tracking meals improves nutrition adaptation.",
+                "suggested_message": "Today I ate ... for breakfast/lunch/dinner.",
+            }
+        )
+
+    if int(metrics.get("workout_days_7d", 0)) <= 2:
+        recommendations.append(
+            {
+                "type": "workout_recovery",
+                "priority": "medium",
+                "title": "Run a low-friction workout day",
+                "reason": "Workout frequency is low this week.",
+                "suggested_message": "Give me a 20-minute easy workout to get back on track.",
+            }
+        )
+
+    if int(metrics.get("shopping_confirmations_7d", 0)) == 0:
+        recommendations.append(
+            {
+                "type": "pantry",
+                "priority": "low",
+                "title": "Sync pantry and shopping items",
+                "reason": "No recent shopping confirmations detected.",
+                "suggested_message": "I am missing these items: ...",
+            }
+        )
+
+    # Persist proactive signal for observability.
+    _record_agent_event(
+        user_id,
+        {
+            "summary": "Proactive check generated",
+            "actions": ["proactive_check_generated"],
+            "decision": {
+                "proactive_recommendation_count": len(recommendations),
+            },
+            "progress_summary": progress_summary,
+        },
+    )
+
+    return {
+        "ok": True,
+        "metrics": metrics,
+        "progress_summary": progress_summary,
+        "trends_7d": trends_7d,
+        "recommendations": recommendations,
+    }
+
+
 def _infer_active_travel_days(
     recent_logs: List[Dict[str, Any]],
     latest_agent_event: Dict[str, Any],
@@ -2115,6 +2348,23 @@ def run_agent(request: AgentRequest) -> AgentResponse:
         or "weekly" in (request.message or "").lower(),
         "resume_training_query": resume_training_query,
     }
+
+    why_parts: List[str] = []
+    if decision.get("should_initialize_plan"):
+        why_parts.append("No existing plans were found, so a fresh plan was initialized.")
+    if travel_resume_signal:
+        why_parts.append("Travel completion was detected, so travel mode was closed and normal training resumed.")
+    if active_travel_window:
+        why_parts.append(f"Active travel window detected ({travel_days} day(s)), so workouts and meals were adjusted.")
+    if meal_on_track_workout_missed:
+        why_parts.append("Meals were logged but workout was missed, so compensation guidance was added.")
+    if recovery_mode.get("enabled"):
+        why_parts.append("Recent missed workouts triggered recovery mode to reduce friction.")
+    if drift.get("status") == "behind":
+        why_parts.append("Progress drift was behind target, so adaptation intensity was increased.")
+    if not why_parts:
+        why_parts.append("No major disruptions detected; the coach continued with the stable plan path.")
+    decision["why_this_action"] = " ".join(why_parts)
 
     if cravings_query and request.mode != "plan":
         decision["should_refresh_plan"] = False

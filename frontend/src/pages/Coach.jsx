@@ -90,6 +90,9 @@ export default function Coach() {
   const [autonomous, setAutonomous] = useState(false);
   const [showTrace, setShowTrace] = useState(false);
   const [liveProgressSummary, setLiveProgressSummary] = useState(null);
+  const [proactiveLoading, setProactiveLoading] = useState(false);
+  const [proactiveData, setProactiveData] = useState(null);
+  const [hasAutoProactiveRun, setHasAutoProactiveRun] = useState(false);
 
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, async (user) => {
@@ -291,6 +294,30 @@ export default function Coach() {
     await callAgent("", selectedMode);
   };
 
+  const runProactiveCheck = async () => {
+    const user = auth.currentUser;
+    if (!user) return;
+
+    setProactiveLoading(true);
+    try {
+      const data = await postJSON("http://127.0.0.1:8000/agent/proactive-check", {
+        user_id: user.uid,
+      });
+      setProactiveData(data || null);
+    } catch (e) {
+      alert(e?.message || "Proactive check failed");
+    } finally {
+      setProactiveLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    const user = auth.currentUser;
+    if (!user || hasAutoProactiveRun) return;
+    setHasAutoProactiveRun(true);
+    void runProactiveCheck();
+  }, [hasAutoProactiveRun]);
+
   const latestProgressSummary = (() => {
     for (let i = messages.length - 1; i >= 0; i -= 1) {
       const msg = messages[i];
@@ -395,8 +422,72 @@ export default function Coach() {
             >
               {showTrace ? "Hide Technical View" : "Show Technical View"}
             </button>
+
+            <button
+              onClick={runProactiveCheck}
+              disabled={proactiveLoading}
+              className="px-3 py-1 text-sm bg-emerald-700/80 border border-emerald-500/40 rounded-md hover:bg-emerald-600/80 disabled:opacity-60"
+            >
+              {proactiveLoading ? "Running Proactive Check..." : "Run Proactive Check"}
+            </button>
           </div>
         </div>
+
+        {proactiveData && (
+          <div className="mb-4 p-3 rounded-xl border border-emerald-700/40 bg-emerald-950/30 space-y-3">
+            <div className="text-sm font-semibold text-emerald-200">Proactive Agent Recommendations</div>
+
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-xs">
+              <div className="rounded-md border border-emerald-700/40 bg-emerald-900/20 p-2">
+                <div className="text-emerald-300/80">Adherence (7d)</div>
+                <div className="text-emerald-100 font-semibold">{Math.round((Number(proactiveData?.metrics?.adherence_rate_7d || 0) * 100))}%</div>
+              </div>
+              <div className="rounded-md border border-emerald-700/40 bg-emerald-900/20 p-2">
+                <div className="text-emerald-300/80">Workout Days (7d)</div>
+                <div className="text-emerald-100 font-semibold">{proactiveData?.metrics?.workout_days_7d || 0}</div>
+              </div>
+              <div className="rounded-md border border-emerald-700/40 bg-emerald-900/20 p-2">
+                <div className="text-emerald-300/80">Meal Logs (7d)</div>
+                <div className="text-emerald-100 font-semibold">{proactiveData?.metrics?.meal_log_days_7d || 0}</div>
+              </div>
+              <div className="rounded-md border border-emerald-700/40 bg-emerald-900/20 p-2">
+                <div className="text-emerald-300/80">Active Streak</div>
+                <div className="text-emerald-100 font-semibold">{proactiveData?.metrics?.active_streak_days || 0} day(s)</div>
+              </div>
+            </div>
+
+            {Array.isArray(proactiveData?.recommendations) && proactiveData.recommendations.length > 0 ? (
+              <div className="space-y-2">
+                {proactiveData.recommendations.map((rec, idx) => (
+                  <div key={`${rec.type || "rec"}-${idx}`} className="rounded-md border border-emerald-700/30 bg-black/20 p-2 text-xs space-y-1">
+                    <div className="font-semibold text-emerald-100">{rec.title} ({rec.priority})</div>
+                    <div className="text-emerald-200/80">{rec.reason}</div>
+                    <div className="text-emerald-300">Try: {rec.suggested_message}</div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="text-xs text-emerald-200/80">No proactive interventions needed right now.</div>
+            )}
+
+            {Array.isArray(proactiveData?.trends_7d) && proactiveData.trends_7d.length > 0 && (
+              <div className="space-y-2">
+                <div className="text-xs font-semibold text-emerald-200">7-day trend snapshot</div>
+                <div className="grid grid-cols-7 gap-1">
+                  {proactiveData.trends_7d.map((t) => (
+                    <div key={t.date} className="rounded-md border border-emerald-700/30 bg-black/20 p-1.5 text-[10px]">
+                      <div className="text-emerald-200/80 mb-1">{String(t.date).slice(5)}</div>
+                      <div className={`h-2 rounded ${t.workout_completed ? "bg-emerald-400" : "bg-zinc-700"}`} title="Workout completed" />
+                      <div className={`h-2 rounded mt-1 ${t.meal_logged ? "bg-teal-300" : "bg-zinc-700"}`} title="Meal logged" />
+                      <div className="text-emerald-200/70 mt-1">{t.workout_minutes || 0}m</div>
+                    </div>
+                  ))}
+                </div>
+                <div className="text-[10px] text-emerald-200/70">Top bar = workout, middle bar = meal log.</div>
+              </div>
+            )}
+          </div>
+        )}
 
         {resolvedProgressSummary && (
           <div className="mb-4 p-3 rounded-xl border border-zinc-700 bg-zinc-900/70 space-y-2">
@@ -450,6 +541,12 @@ export default function Coach() {
     >
     {m.role === "ai" && <div className="text-xs text-zinc-400">Lifeline Coach</div>}
     <div className="leading-relaxed whitespace-pre-line">{m.text}</div>
+
+    {m.role === "ai" && typeof m.agent?.decision?.why_this_action === "string" && m.agent.decision.why_this_action.trim() && (
+      <div className="text-xs text-amber-200/90 rounded-md border border-amber-500/30 bg-amber-500/10 p-2">
+        Why this action: {m.agent.decision.why_this_action}
+      </div>
+    )}
 
     {/* Agent internals */}
     {showTrace && m.role === "ai" && m.agent && (
