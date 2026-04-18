@@ -1855,6 +1855,153 @@ def _build_7d_trends(logs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return trends
 
 
+def _compute_activity_streak_until(logs: List[Dict[str, Any]], end_date: date) -> int:
+    if not logs:
+        return 0
+
+    activity_by_date: Dict[date, bool] = {}
+    for item in logs:
+        d = _parse_date_key(item.get("date"))
+        if d is None or d > end_date:
+            continue
+        activity_by_date[d] = _is_workout_logged(item) or _is_meal_logged(item)
+
+    streak = 0
+    cursor = end_date
+    while activity_by_date.get(cursor, False):
+        streak += 1
+        cursor -= timedelta(days=1)
+    return streak
+
+
+def _trend_direction(delta: float) -> str:
+    if delta > 0:
+        return "up"
+    if delta < 0:
+        return "down"
+    return "flat"
+
+
+def _count_logged_days(trends: List[Dict[str, Any]], key: str) -> int:
+    return sum(1 for item in trends if isinstance(item, dict) and bool(item.get(key, False)))
+
+
+def generate_insight_narratives(summary: Dict[str, Any], trends: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    metrics = summary.get("metrics") if isinstance(summary.get("metrics"), dict) else summary
+    comparison = summary.get("trend_comparison_7d") if isinstance(summary.get("trend_comparison_7d"), dict) else {}
+
+    active_streak_days = int(metrics.get("active_streak_days", 0) or 0)
+    adherence_rate_7d = float(metrics.get("adherence_rate_7d", 0) or 0)
+
+    narratives: List[Dict[str, str]] = []
+
+    if active_streak_days >= 4:
+        narratives.append(
+            {
+                "type": "positive",
+                "text": f"You are on a {active_streak_days}-day streak. Keep this consistency to build long-term momentum.",
+            }
+        )
+    elif active_streak_days >= 2:
+        narratives.append(
+            {
+                "type": "warning",
+                "text": f"You have a {active_streak_days}-day streak. One more consistent day can turn this into a stronger run.",
+            }
+        )
+    else:
+        narratives.append(
+            {
+                "type": "critical",
+                "text": "Your streak is currently low. Start with a short workout or meal log today to restart momentum.",
+            }
+        )
+
+    adherence_pct = int(round(adherence_rate_7d * 100))
+    if adherence_pct >= 70:
+        narratives.append(
+            {
+                "type": "positive",
+                "text": f"Your 7-day adherence is {adherence_pct}%, which shows strong follow-through across workouts and meals.",
+            }
+        )
+    elif adherence_pct >= 45:
+        narratives.append(
+            {
+                "type": "warning",
+                "text": f"Your 7-day adherence is {adherence_pct}%. A small consistency push this week can raise results quickly.",
+            }
+        )
+    else:
+        narratives.append(
+            {
+                "type": "critical",
+                "text": f"Your 7-day adherence is {adherence_pct}%. Focus on one non-negotiable daily habit to stabilize progress.",
+            }
+        )
+
+    meal_compare = comparison.get("meal_log_days_7d") if isinstance(comparison.get("meal_log_days_7d"), dict) else {}
+    workout_compare = comparison.get("workout_days_7d") if isinstance(comparison.get("workout_days_7d"), dict) else {}
+
+    meal_prev = float(meal_compare.get("previous", 0) or 0)
+    meal_cur = float(meal_compare.get("current", 0) or 0)
+    workout_prev = float(workout_compare.get("previous", 0) or 0)
+    workout_cur = float(workout_compare.get("current", 0) or 0)
+
+    drop_candidates: List[tuple[str, float]] = []
+    if meal_prev > 0 and meal_cur < meal_prev:
+        drop_candidates.append(("Meal logging", ((meal_prev - meal_cur) / meal_prev) * 100.0))
+    if workout_prev > 0 and workout_cur < workout_prev:
+        drop_candidates.append(("Workout consistency", ((workout_prev - workout_cur) / workout_prev) * 100.0))
+
+    if drop_candidates:
+        area, drop_pct = max(drop_candidates, key=lambda x: x[1])
+        rounded_drop = int(round(drop_pct))
+        severity = "critical" if rounded_drop >= 30 else "warning"
+        narratives.append(
+            {
+                "type": severity,
+                "text": f"{area} dropped {rounded_drop}% compared with the previous 7 days. A quick recovery plan can prevent a longer dip.",
+            }
+        )
+    else:
+        narratives.append(
+            {
+                "type": "positive",
+                "text": "No major drop detected versus the previous 7 days. Your consistency trend looks stable.",
+            }
+        )
+
+    workout_days = _count_logged_days(trends, "workout_completed")
+    workout_minutes = [int(item.get("workout_minutes", 0) or 0) for item in trends if isinstance(item, dict)]
+    active_minutes = [m for m in workout_minutes if m > 0]
+    avg_minutes = int(round(sum(active_minutes) / len(active_minutes))) if active_minutes else 0
+
+    if workout_days >= 4 and avg_minutes >= 30:
+        narratives.append(
+            {
+                "type": "positive",
+                "text": f"Performance pattern: you trained on {workout_days} days this week with about {avg_minutes} minutes per active day.",
+            }
+        )
+    elif workout_days == 0:
+        narratives.append(
+            {
+                "type": "critical",
+                "text": "Performance pattern: no workouts were logged this week. Start with a 15-20 minute session to re-engage.",
+            }
+        )
+    else:
+        narratives.append(
+            {
+                "type": "warning",
+                "text": f"Performance pattern: activity happened on {workout_days} day(s) this week. Aim for one extra session to improve momentum.",
+            }
+        )
+
+    return narratives
+
+
 def _fetch_recent_agent_events(user_id: str, max_entries: int = 300) -> List[Dict[str, Any]]:
     docs = (
         db.collection("users")
@@ -1886,43 +2033,121 @@ def get_agent_metrics(user_id: str) -> Dict[str, Any]:
 
     today = _utc_now().date()
     last_7_start = today - timedelta(days=6)
+    prev_7_start = today - timedelta(days=13)
+    prev_7_end = today - timedelta(days=7)
 
     logs_7d: List[Dict[str, Any]] = []
+    prev_logs_7d: List[Dict[str, Any]] = []
     for item in all_logs:
         d = _parse_date_key(item.get("date"))
         if d is None:
             continue
-        if d < last_7_start or d > today:
+        if last_7_start <= d <= today:
+            logs_7d.append(item)
             continue
-        logs_7d.append(item)
+        if prev_7_start <= d <= prev_7_end:
+            prev_logs_7d.append(item)
 
     workout_days_7d = _count_workout_days(logs_7d)
     meal_days_7d = _count_meal_logged_days(logs_7d)
     logs_present_7d = len({item.get("date") for item in logs_7d if isinstance(item.get("date"), str)})
+    prev_workout_days_7d = _count_workout_days(prev_logs_7d)
+    prev_meal_days_7d = _count_meal_logged_days(prev_logs_7d)
 
     events = _fetch_recent_agent_events(user_id)
     plan_refreshes_7d = 0
+    plan_refreshes_prev_7d = 0
     for event in events:
         created = event.get("createdAt")
         created_date = created.date() if hasattr(created, "date") else None
-        if created_date and created_date < last_7_start:
+        if created_date is None:
             continue
+
+        if created_date < prev_7_start:
+            continue
+
         actions = event.get("actions") if isinstance(event.get("actions"), list) else []
-        if "plans_refreshed" in actions:
+        if "plans_refreshed" not in actions:
+            continue
+
+        if last_7_start <= created_date <= today:
             plan_refreshes_7d += 1
+        elif prev_7_start <= created_date <= prev_7_end:
+            plan_refreshes_prev_7d += 1
 
     shopping_plans = _fetch_recent_shopping_plans(user_id)
     confirmations_7d = 0
+    confirmations_prev_7d = 0
     for item in shopping_plans:
         confirmed_at = item.get("confirmedAt")
         confirmed_date = confirmed_at.date() if hasattr(confirmed_at, "date") else None
-        if confirmed_date is None or confirmed_date < last_7_start:
+        if confirmed_date is None or confirmed_date < prev_7_start:
             continue
         if str(item.get("status", "")).lower() == "confirmed":
-            confirmations_7d += 1
+            if last_7_start <= confirmed_date <= today:
+                confirmations_7d += 1
+            elif prev_7_start <= confirmed_date <= prev_7_end:
+                confirmations_prev_7d += 1
 
     streak = _compute_activity_streak(all_logs)
+    prev_streak = _compute_activity_streak_until(all_logs, prev_7_end)
     adherence_7d = round((workout_days_7d + meal_days_7d) / 14.0, 2)
+    adherence_prev_7d = round((prev_workout_days_7d + prev_meal_days_7d) / 14.0, 2)
+
+    trend_comparison_7d = {
+        "adherence_rate_7d": {
+            "current": adherence_7d,
+            "previous": adherence_prev_7d,
+            "delta": round(adherence_7d - adherence_prev_7d, 2),
+            "direction": _trend_direction(adherence_7d - adherence_prev_7d),
+        },
+        "active_streak_days": {
+            "current": streak,
+            "previous": prev_streak,
+            "delta": streak - prev_streak,
+            "direction": _trend_direction(float(streak - prev_streak)),
+        },
+        "workout_days_7d": {
+            "current": workout_days_7d,
+            "previous": prev_workout_days_7d,
+            "delta": workout_days_7d - prev_workout_days_7d,
+            "direction": _trend_direction(float(workout_days_7d - prev_workout_days_7d)),
+        },
+        "meal_log_days_7d": {
+            "current": meal_days_7d,
+            "previous": prev_meal_days_7d,
+            "delta": meal_days_7d - prev_meal_days_7d,
+            "direction": _trend_direction(float(meal_days_7d - prev_meal_days_7d)),
+        },
+        "plan_refreshes_7d": {
+            "current": plan_refreshes_7d,
+            "previous": plan_refreshes_prev_7d,
+            "delta": plan_refreshes_7d - plan_refreshes_prev_7d,
+            "direction": _trend_direction(float(plan_refreshes_7d - plan_refreshes_prev_7d)),
+        },
+        "shopping_confirmations_7d": {
+            "current": confirmations_7d,
+            "previous": confirmations_prev_7d,
+            "delta": confirmations_7d - confirmations_prev_7d,
+            "direction": _trend_direction(float(confirmations_7d - confirmations_prev_7d)),
+        },
+    }
+
+    narratives = generate_insight_narratives(
+        {
+            "metrics": {
+                "active_streak_days": streak,
+                "adherence_rate_7d": adherence_7d,
+                "workout_days_7d": workout_days_7d,
+                "meal_log_days_7d": meal_days_7d,
+                "days_with_any_log_7d": logs_present_7d,
+                "plan_refreshes_7d": plan_refreshes_7d,
+                "shopping_confirmations_7d": confirmations_7d,
+            },
+            "trend_comparison_7d": trend_comparison_7d,
+        },
+        trends_7d,
+    )
 
     return {
         "progress_summary": progress_summary,
@@ -1935,6 +2160,9 @@ def get_agent_metrics(user_id: str) -> Dict[str, Any]:
             "plan_refreshes_7d": plan_refreshes_7d,
             "shopping_confirmations_7d": confirmations_7d,
         },
+        "trend_comparison_7d": trend_comparison_7d,
+        "narratives": narratives,
+        "trends": trends_7d,
         "trends_7d": trends_7d,
     }
 

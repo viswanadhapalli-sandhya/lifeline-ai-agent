@@ -74,6 +74,9 @@ export default function Nutrition() {
           setPlanMeta({
             id: latestDoc.id,
             createdAt,
+            evolvedFromActivity: Boolean(latestData.evolvedFromActivity),
+            evolutionBanner: String(latestData.evolutionBanner || "").trim(),
+            evolutionMode: String(latestData?.evolutionMeta?.mode || "").trim(),
           });
           try {
             localStorage.setItem("nutritionPlan", JSON.stringify(latestPlan));
@@ -207,6 +210,15 @@ export default function Nutrition() {
               ? `Updated ${planMeta.createdAt.toLocaleString()}`
               : "Updated just now"}
           </span>
+        </div>
+      )}
+
+      {planMeta?.evolvedFromActivity && (
+        <div className="mb-4 rounded-lg border border-emerald-400/40 bg-emerald-900/20 px-4 py-3 text-sm text-emerald-100">
+          <div className="font-semibold">{planMeta?.evolutionBanner || "Your plan evolved based on your activity"}</div>
+          {planMeta?.evolutionMode && (
+            <div className="mt-1 text-xs text-emerald-200/90">Mode: {planMeta.evolutionMode.replaceAll("_", " ")}</div>
+          )}
         </div>
       )}
 

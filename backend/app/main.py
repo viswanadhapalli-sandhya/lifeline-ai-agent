@@ -25,9 +25,13 @@ from app.routers.chat import router as chat_router
 from app.routers.agent import router as agent_router
 from app.services.proactive_loop_service import (
     APP_TZ,
+    WEEKLY_EVOLUTION_DAY_OF_WEEK,
+    WEEKLY_EVOLUTION_HOUR,
+    WEEKLY_EVOLUTION_MINUTE,
     run_autonomous_proactive_loop,
     run_proactive_event_retention_cleanup,
     run_proactive_slot,
+    run_weekly_plan_evolution,
 )
 
 
@@ -55,6 +59,20 @@ def _safe_run_proactive_cleanup(retention_days: int, max_events_per_user: int) -
         print(f"[proactive-cleanup] failed: {exc}")
 
 
+def _safe_run_weekly_plan_evolution() -> None:
+    try:
+        result = run_weekly_plan_evolution()
+        print(
+            "[weekly-plan-evolution]"
+            f" users={result.get('users_processed', 0)}"
+            f" evolved={result.get('evolved', 0)}"
+            f" skipped={result.get('skipped', 0)}"
+            f" errors={result.get('errors', 0)}"
+        )
+    except Exception as exc:
+        print(f"[weekly-plan-evolution] failed: {exc}")
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     scheduler = BackgroundScheduler(timezone=APP_TZ)
@@ -66,6 +84,17 @@ async def lifespan(_app: FastAPI):
     scheduler.add_job(lambda: _safe_run_slot("morning"), CronTrigger(hour=8, minute=0, timezone=APP_TZ), id="proactive-morning", replace_existing=True)
     scheduler.add_job(lambda: _safe_run_slot("afternoon"), CronTrigger(hour=14, minute=0, timezone=APP_TZ), id="proactive-afternoon", replace_existing=True)
     scheduler.add_job(lambda: _safe_run_slot("night"), CronTrigger(hour=21, minute=0, timezone=APP_TZ), id="proactive-night", replace_existing=True)
+    scheduler.add_job(
+        _safe_run_weekly_plan_evolution,
+        CronTrigger(
+            day_of_week=WEEKLY_EVOLUTION_DAY_OF_WEEK,
+            hour=WEEKLY_EVOLUTION_HOUR,
+            minute=WEEKLY_EVOLUTION_MINUTE,
+            timezone=APP_TZ,
+        ),
+        id="weekly-plan-evolution",
+        replace_existing=True,
+    )
 
     archive_enabled = os.getenv("PROACTIVE_ARCHIVE_ENABLED", "true").strip().lower() in {"1", "true", "yes"}
     archive_retention_days = int(os.getenv("PROACTIVE_RETENTION_DAYS", "45"))

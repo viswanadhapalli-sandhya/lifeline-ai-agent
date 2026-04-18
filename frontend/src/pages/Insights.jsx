@@ -50,7 +50,9 @@ export default function Insights() {
   }
 
   const m = metricsData?.metrics || {};
-  const trends = metricsData?.trends_7d || proactiveData?.trends_7d || [];
+  const trends = metricsData?.trends || metricsData?.trends_7d || proactiveData?.trends_7d || [];
+  const narratives = Array.isArray(metricsData?.narratives) ? metricsData.narratives : [];
+  const trendComparison = metricsData?.trend_comparison_7d || {};
 
   return (
     <div className="min-h-screen bg-black text-white">
@@ -71,10 +73,52 @@ export default function Insights() {
         </div>
 
         <div className="grid md:grid-cols-4 gap-3 text-sm">
-          <StatCard title="Adherence (7d)" value={`${Math.round((Number(m.adherence_rate_7d || 0) * 100))}%`} />
-          <StatCard title="Active Streak" value={`${m.active_streak_days || 0} day(s)`} />
-          <StatCard title="Plan Refreshes (7d)" value={`${m.plan_refreshes_7d || 0}`} />
-          <StatCard title="Shopping Confirms (7d)" value={`${m.shopping_confirmations_7d || 0}`} />
+          <StatCard
+            title="Adherence (7d)"
+            value={`${Math.round(Number(m.adherence_rate_7d || 0) * 100)}%`}
+            trend={trendComparison?.adherence_rate_7d}
+          />
+          <StatCard
+            title="Active Streak"
+            value={`${m.active_streak_days || 0} day(s)`}
+            trend={trendComparison?.active_streak_days}
+          />
+          <StatCard
+            title="Plan Refreshes (7d)"
+            value={`${m.plan_refreshes_7d || 0}`}
+            trend={trendComparison?.plan_refreshes_7d}
+          />
+          <StatCard
+            title="Shopping Confirms (7d)"
+            value={`${m.shopping_confirmations_7d || 0}`}
+            trend={trendComparison?.shopping_confirmations_7d}
+          />
+        </div>
+
+        <div className="rounded-xl border border-zinc-700 bg-zinc-900/60 p-4 space-y-3">
+          <div className="text-lg font-semibold">Narrative Insights</div>
+          {narratives.length > 0 ? (
+            <div className="grid md:grid-cols-2 gap-3">
+              {narratives.map((item, idx) => {
+                const narrativeType = String(item?.type || "warning").toLowerCase();
+                const style = narrativeStyleByType[narrativeType] || narrativeStyleByType.warning;
+                return (
+                  <div
+                    key={`${narrativeType}-${idx}`}
+                    className={`rounded-lg border p-3 text-sm ${style.border} ${style.bg}`}
+                  >
+                    <div className="flex items-center gap-2 font-semibold">
+                      <span className={style.iconColor}>{style.icon}</span>
+                      <span className={style.titleColor}>{style.label}</span>
+                    </div>
+                    <div className="mt-2 text-zinc-200">{item?.text || "No narrative available."}</div>
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
+            <div className="text-sm text-zinc-400">Narratives will appear once enough activity is available.</div>
+          )}
         </div>
 
         <div className="rounded-xl border border-zinc-700 bg-zinc-900/60 p-4 space-y-3">
@@ -117,11 +161,49 @@ export default function Insights() {
   );
 }
 
-function StatCard({ title, value }) {
+const narrativeStyleByType = {
+  positive: {
+    icon: "●",
+    label: "Positive",
+    border: "border-emerald-500/60",
+    bg: "bg-emerald-900/30",
+    iconColor: "text-emerald-300",
+    titleColor: "text-emerald-200",
+  },
+  warning: {
+    icon: "●",
+    label: "Warning",
+    border: "border-yellow-500/60",
+    bg: "bg-yellow-900/20",
+    iconColor: "text-yellow-300",
+    titleColor: "text-yellow-200",
+  },
+  critical: {
+    icon: "●",
+    label: "Critical",
+    border: "border-red-500/60",
+    bg: "bg-red-900/20",
+    iconColor: "text-red-300",
+    titleColor: "text-red-200",
+  },
+};
+
+function StatCard({ title, value, trend }) {
+  const direction = String(trend?.direction || "flat").toLowerCase();
+  const trendDelta = Number(trend?.delta || 0);
+
+  const arrow = direction === "up" ? "↑" : direction === "down" ? "↓" : "→";
+  const arrowColor = direction === "up" ? "text-emerald-300" : direction === "down" ? "text-red-300" : "text-zinc-400";
+  const deltaPrefix = trendDelta > 0 ? "+" : "";
+
   return (
     <div className="rounded-xl border border-zinc-700 bg-zinc-900/60 p-3">
       <div className="text-zinc-400 text-xs">{title}</div>
       <div className="text-zinc-100 text-lg font-semibold mt-1">{value}</div>
+      <div className={`text-xs mt-1 ${arrowColor}`}>
+        {arrow} {deltaPrefix}
+        {Number.isFinite(trendDelta) ? trendDelta : 0} vs previous 7d
+      </div>
     </div>
   );
 }

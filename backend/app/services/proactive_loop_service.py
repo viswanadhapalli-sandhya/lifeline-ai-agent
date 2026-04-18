@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
 from zoneinfo import ZoneInfo
@@ -11,6 +12,8 @@ from firebase_admin import firestore
 
 from app.core.firebase_client import db
 from app.services.agent_service import get_proactive_recommendations
+from app.services.nutrition_service import generate_nutrition_plan
+from app.services.workout_service import generate_workout_plan
 
 try:
     APP_TZ = ZoneInfo("Asia/Kolkata")
@@ -32,6 +35,10 @@ PROACTIVE_DEDUP_HOURS = int(os.getenv("PROACTIVE_DEDUP_HOURS", "12"))
 PROACTIVE_MAX_USER_CONCURRENCY = int(os.getenv("PROACTIVE_MAX_USER_CONCURRENCY", "10"))
 PROACTIVE_RETENTION_DAYS = int(os.getenv("PROACTIVE_RETENTION_DAYS", "45"))
 PROACTIVE_ARCHIVE_MAX_EVENTS_PER_USER = int(os.getenv("PROACTIVE_ARCHIVE_MAX_EVENTS_PER_USER", "250"))
+
+WEEKLY_EVOLUTION_HOUR = int(os.getenv("WEEKLY_PLAN_EVOLUTION_HOUR", "6"))
+WEEKLY_EVOLUTION_MINUTE = int(os.getenv("WEEKLY_PLAN_EVOLUTION_MINUTE", "15"))
+WEEKLY_EVOLUTION_DAY_OF_WEEK = os.getenv("WEEKLY_PLAN_EVOLUTION_DAY", "mon")
 
 
 def _now_local() -> datetime:
@@ -300,6 +307,457 @@ def _fetch_recent_daily_logs(user_id: str, days: int = 3) -> List[Dict[str, Any]
         .get()
     )
     return [doc.to_dict() or {} for doc in docs]
+
+
+def _fetch_user_profile(user_id: str) -> Dict[str, Any]:
+    snap = db.collection("users").document(user_id).get()
+    if not snap.exists:
+        return {}
+    return snap.to_dict() or {}
+
+
+def _fetch_latest_health_record(user_id: str) -> Dict[str, Any]:
+    docs = (
+        db.collection("users")
+        .document(user_id)
+        .collection("healthRecords")
+        .order_by("createdAt", direction=firestore.Query.DESCENDING)
+        .limit(1)
+        .get()
+    )
+    if not docs:
+        return {}
+    return docs[0].to_dict() or {}
+
+
+def _is_workout_logged(item: Dict[str, Any]) -> bool:
+    minutes = item.get("workout_minutes", 0)
+    if isinstance(minutes, (int, float)) and int(minutes) > 0:
+        return True
+    return bool(item.get("workout_completed", False))
+
+
+def _is_meal_logged(item: Dict[str, Any]) -> bool:
+    meal_text = str(item.get("meal_text") or "").strip()
+    return bool(item.get("meal_logged", False)) or bool(meal_text)
+
+
+def _is_travel_context_active(user_id: str, recent_logs: List[Dict[str, Any]]) -> bool:
+    for item in recent_logs[:14]:
+        if bool(item.get("travel_window_closed", False)):
+            return False
+        if bool(item.get("travel_disruption", False)):
+            return True
+
+    snap = db.collection("users").document(user_id).collection("travelState").document("current").get()
+    if not snap.exists:
+        return False
+    payload = snap.to_dict() or {}
+    return bool(payload.get("active", False))
+
+
+def _compute_recent_adherence(summary: Dict[str, Any], recent_logs: List[Dict[str, Any]]) -> float:
+    raw = summary.get("adherence_rate_7d")
+    if isinstance(raw, (int, float)):
+        val = float(raw)
+        if val > 1.0:
+            val = val / 100.0
+        return max(0.0, min(1.0, val))
+
+    logs_7d = recent_logs[:7]
+    workout_days = sum(1 for item in logs_7d if _is_workout_logged(item))
+    meal_days = sum(1 for item in logs_7d if _is_meal_logged(item))
+    return max(0.0, min(1.0, (workout_days + meal_days) / 14.0))
+
+
+def _normalize_workout_day(day: Dict[str, Any], day_number: int) -> Dict[str, Any]:
+    safe = day if isinstance(day, dict) else {}
+    return {
+        "day": str(safe.get("day") or f"Day {day_number}"),
+        "warmup": safe.get("warmup") if isinstance(safe.get("warmup"), list) else ["5 min walk"],
+        "exercises": safe.get("exercises") if isinstance(safe.get("exercises"), list) else [],
+        "cooldown": safe.get("cooldown") if isinstance(safe.get("cooldown"), list) else ["Light stretching"],
+        "tip": str(safe.get("tip") or "Stay consistent and keep form controlled."),
+    }
+
+
+def _normalize_nutrition_day(day: Dict[str, Any], day_number: int) -> Dict[str, Any]:
+    safe = day if isinstance(day, dict) else {}
+    return {
+        "day": str(safe.get("day") or f"Day {day_number}"),
+        "breakfast": safe.get("breakfast") if isinstance(safe.get("breakfast"), list) else ["Vegetable oats"],
+        "lunch": safe.get("lunch") if isinstance(safe.get("lunch"), list) else ["Dal, rice, sabzi"],
+        "snacks": safe.get("snacks") if isinstance(safe.get("snacks"), list) else ["Fruit + nuts"],
+        "dinner": safe.get("dinner") if isinstance(safe.get("dinner"), list) else ["Roti + protein + salad"],
+        "tip": str(safe.get("tip") or "Hydrate well and avoid long fasting gaps."),
+    }
+
+
+def _normalize_workout_plan(plan: Any) -> List[Dict[str, Any]]:
+    normalized: List[Dict[str, Any]] = []
+    raw = plan if isinstance(plan, list) else []
+    for idx, day in enumerate(raw[:7], start=1):
+        normalized.append(_normalize_workout_day(day, idx))
+    while len(normalized) < 7:
+        normalized.append(_normalize_workout_day({}, len(normalized) + 1))
+    return normalized
+
+
+def _normalize_nutrition_plan(plan: Any) -> List[Dict[str, Any]]:
+    normalized: List[Dict[str, Any]] = []
+    raw = plan if isinstance(plan, list) else []
+    for idx, day in enumerate(raw[:7], start=1):
+        normalized.append(_normalize_nutrition_day(day, idx))
+    while len(normalized) < 7:
+        normalized.append(_normalize_nutrition_day({}, len(normalized) + 1))
+    return normalized
+
+
+def _adjust_reps(value: Any, delta: int) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "10"
+    match = re.search(r"\d+", text)
+    if not match:
+        return text
+    base = int(match.group(0))
+    adjusted = max(6, base + delta)
+    return text[: match.start()] + str(adjusted) + text[match.end() :]
+
+
+def _adjust_rest_seconds(value: Any, delta: int) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "60 sec"
+    match = re.search(r"\d+", text)
+    if not match:
+        return text
+    base = int(match.group(0))
+    adjusted = max(20, base + delta)
+    return text[: match.start()] + str(adjusted) + text[match.end() :]
+
+
+def _workout_plan_increase_intensity(base_plan: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    updated = _normalize_workout_plan(base_plan)
+    for day in updated:
+        next_exercises = []
+        for ex in day.get("exercises", []):
+            if not isinstance(ex, dict):
+                continue
+            sets_val = ex.get("sets")
+            sets = int(sets_val) if isinstance(sets_val, (int, float)) and int(sets_val) > 0 else 3
+            next_exercises.append(
+                {
+                    **ex,
+                    "sets": min(6, sets + 1),
+                    "reps": _adjust_reps(ex.get("reps"), +2),
+                    "rest": _adjust_rest_seconds(ex.get("rest"), -10),
+                }
+            )
+        day["exercises"] = next_exercises
+        day["tip"] = "Progression week: slightly increase load while keeping technique strict."
+    return updated
+
+
+def _workout_plan_simplify(base_plan: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    updated = _normalize_workout_plan(base_plan)
+    for day in updated:
+        next_exercises = []
+        for ex in day.get("exercises", []):
+            if not isinstance(ex, dict):
+                continue
+            sets_val = ex.get("sets")
+            sets = int(sets_val) if isinstance(sets_val, (int, float)) and int(sets_val) > 0 else 3
+            next_exercises.append(
+                {
+                    **ex,
+                    "sets": max(1, sets - 1),
+                    "reps": _adjust_reps(ex.get("reps"), -2),
+                    "rest": _adjust_rest_seconds(ex.get("rest"), +15),
+                }
+            )
+        day["exercises"] = next_exercises[: max(1, len(next_exercises) - 1)] if next_exercises else []
+        day["tip"] = "Recovery-first week: lower volume and rebuild consistency with easier sessions."
+    return updated
+
+
+def _workout_plan_maintenance(base_plan: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    updated = _normalize_workout_plan(base_plan)
+    for day in updated:
+        day["warmup"] = ["10 min light walk or mobility"]
+        day["exercises"] = []
+        day["cooldown"] = ["5-10 min breathing and gentle stretching"]
+        day["tip"] = "Maintenance mode: preserve routine and recovery while travel context is active."
+    return updated
+
+
+def _nutrition_plan_increase_intensity(base_plan: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    updated = _normalize_nutrition_plan(base_plan)
+    for day in updated:
+        snacks = day.get("snacks") if isinstance(day.get("snacks"), list) else []
+        day["snacks"] = [*snacks[:2], "Post-workout protein-rich option"]
+        day["tip"] = "High-adherence week: keep protein timing consistent and fuel training quality."
+    return updated
+
+
+def _nutrition_plan_simplify(base_plan: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    updated = _normalize_nutrition_plan(base_plan)
+    for day in updated:
+        day["breakfast"] = (day.get("breakfast") or [])[:2]
+        day["lunch"] = (day.get("lunch") or [])[:2]
+        day["snacks"] = (day.get("snacks") or [])[:1]
+        day["dinner"] = (day.get("dinner") or [])[:2]
+        day["tip"] = "Low-friction week: simpler meals, repeatable choices, and focus on logging consistency."
+    return updated
+
+
+def _nutrition_plan_maintenance(base_plan: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    updated = _normalize_nutrition_plan(base_plan)
+    for day in updated:
+        day["breakfast"] = ["Portable protein option", "One fruit"]
+        day["lunch"] = ["Simple thali: dal + sabzi + controlled rice/roti"]
+        day["snacks"] = ["Roasted chana or nuts", "Hydration check"]
+        day["dinner"] = ["Lean protein + vegetables", "Lighter dinner than lunch"]
+        day["tip"] = "Maintenance mode: travel-practical meals, hydration, and portion control."
+    return updated
+
+
+def _save_plan_evolution_revision(
+    user_id: str,
+    collection_name: str,
+    plan: List[Dict[str, Any]],
+    goal: str,
+    mode: str,
+    adherence: float,
+    previous_plan_id: str | None,
+) -> str:
+    col_ref = db.collection("users").document(user_id).collection(collection_name)
+    doc_ref = col_ref.document()
+    now_iso = _now_local().isoformat()
+
+    doc_ref.set(
+        {
+            "plan": plan,
+            "goal": goal,
+            "source": "weekly_plan_evolution",
+            "reason": mode,
+            "isLatest": True,
+            "evolvedFromActivity": True,
+            "evolutionBanner": "Your plan evolved based on your activity",
+            "evolutionMeta": {
+                "mode": mode,
+                "adherence_rate_7d": round(adherence, 2),
+                "previous_plan_id": previous_plan_id,
+                "trigger": "weekly_scheduler",
+                "triggered_at": now_iso,
+            },
+            "createdAt": firestore.SERVER_TIMESTAMP,
+            "updatedAt": firestore.SERVER_TIMESTAMP,
+        }
+    )
+
+    latest_docs = col_ref.where("isLatest", "==", True).stream()
+    batch = db.batch()
+    for snap in latest_docs:
+        if snap.id == doc_ref.id:
+            continue
+        batch.set(
+            snap.reference,
+            {
+                "isLatest": False,
+                "updatedAt": firestore.SERVER_TIMESTAMP,
+            },
+            merge=True,
+        )
+    batch.commit()
+
+    return doc_ref.id
+
+
+def _already_evolved_recently(user_id: str) -> bool:
+    events = _fetch_recent_agent_events(user_id, max_entries=30)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=6)
+    for event in events:
+        if str(event.get("type", "")).lower() != "plan_evolution":
+            continue
+        created = _to_utc_datetime(event.get("createdAt"))
+        if created is not None and created >= cutoff:
+            return True
+    return False
+
+
+def _build_default_workout_seed(profile: Dict[str, Any]) -> Any:
+    return type(
+        "WorkoutSeed",
+        (),
+        {
+            "goal": str(profile.get("goal") or "general fitness"),
+            "location": str(profile.get("location") or "home"),
+            "time_per_day": int(profile.get("time_per_day", 30) or 30),
+            "fitness_level": str(profile.get("fitness_level") or "beginner"),
+            "equipment": str(profile.get("equipment") or "none"),
+        },
+    )()
+
+
+def _build_default_nutrition_seed(profile: Dict[str, Any]) -> Any:
+    return type(
+        "NutritionSeed",
+        (),
+        {
+            "goal": str(profile.get("goal") or "general fitness"),
+            "diet": str(profile.get("diet") or "balanced"),
+            "activity": str(profile.get("activity") or "moderate"),
+            "allergies": str(profile.get("allergies") or "none"),
+        },
+    )()
+
+
+def evaluate_and_evolve_plan(uid: str) -> Dict[str, Any]:
+    if not uid:
+        return {"ok": False, "status": "invalid_user"}
+
+    if _already_evolved_recently(uid):
+        return {
+            "ok": True,
+            "status": "skipped_recent_evolution",
+            "user_id": uid,
+        }
+
+    summary = _fetch_progress_summary(uid)
+    recent_logs = _fetch_recent_daily_logs(uid, days=14)
+    adherence = _compute_recent_adherence(summary, recent_logs)
+    travel_active = _is_travel_context_active(uid, recent_logs)
+
+    if travel_active:
+        mode = "maintenance"
+    elif adherence > 0.80:
+        mode = "increase_intensity"
+    elif adherence < 0.50:
+        mode = "simplify"
+    else:
+        return {
+            "ok": True,
+            "status": "skipped_no_adjustment_needed",
+            "user_id": uid,
+            "adherence_rate_7d": round(adherence, 2),
+        }
+
+    workout_latest = _fetch_latest_plan(uid, "workoutPlans")
+    nutrition_latest = _fetch_latest_plan(uid, "nutritionPlans")
+    profile = {**_fetch_user_profile(uid), **_fetch_latest_health_record(uid)}
+    goal = str(
+        workout_latest.get("goal")
+        or nutrition_latest.get("goal")
+        or profile.get("goal")
+        or "general fitness"
+    )
+
+    workout_plan = workout_latest.get("plan") if isinstance(workout_latest.get("plan"), list) else []
+    nutrition_plan = nutrition_latest.get("plan") if isinstance(nutrition_latest.get("plan"), list) else []
+
+    if not workout_plan:
+        generated = generate_workout_plan(_build_default_workout_seed(profile))
+        workout_plan = generated.get("plan") if isinstance(generated.get("plan"), list) else []
+    if not nutrition_plan:
+        generated = generate_nutrition_plan(_build_default_nutrition_seed(profile))
+        nutrition_plan = generated.get("plan") if isinstance(generated.get("plan"), list) else []
+
+    if mode == "increase_intensity":
+        next_workout = _workout_plan_increase_intensity(workout_plan)
+        next_nutrition = _nutrition_plan_increase_intensity(nutrition_plan)
+    elif mode == "simplify":
+        next_workout = _workout_plan_simplify(workout_plan)
+        next_nutrition = _nutrition_plan_simplify(nutrition_plan)
+    else:
+        next_workout = _workout_plan_maintenance(workout_plan)
+        next_nutrition = _nutrition_plan_maintenance(nutrition_plan)
+
+    workout_doc_id = _save_plan_evolution_revision(
+        user_id=uid,
+        collection_name="workoutPlans",
+        plan=next_workout,
+        goal=goal,
+        mode=mode,
+        adherence=adherence,
+        previous_plan_id=workout_latest.get("id") if isinstance(workout_latest, dict) else None,
+    )
+    nutrition_doc_id = _save_plan_evolution_revision(
+        user_id=uid,
+        collection_name="nutritionPlans",
+        plan=next_nutrition,
+        goal=goal,
+        mode=mode,
+        adherence=adherence,
+        previous_plan_id=nutrition_latest.get("id") if isinstance(nutrition_latest, dict) else None,
+    )
+
+    db.collection("users").document(uid).collection("agentEvents").add(
+        {
+            "type": "plan_evolution",
+            "summary": "Weekly plans evolved based on adherence and context",
+            "actions": ["plans_refreshed", "weekly_plan_evolved"],
+            "source": "weekly_scheduler",
+            "decision": {
+                "mode": mode,
+                "adherence_rate_7d": round(adherence, 2),
+                "travel_active": travel_active,
+                "workout_plan_id": workout_doc_id,
+                "nutrition_plan_id": nutrition_doc_id,
+            },
+            "createdAt": firestore.SERVER_TIMESTAMP,
+        }
+    )
+
+    return {
+        "ok": True,
+        "status": "evolved",
+        "user_id": uid,
+        "mode": mode,
+        "adherence_rate_7d": round(adherence, 2),
+        "travel_active": travel_active,
+        "workout_plan_id": workout_doc_id,
+        "nutrition_plan_id": nutrition_doc_id,
+    }
+
+
+def run_weekly_plan_evolution(user_id: str | None = None) -> Dict[str, Any]:
+    user_ids = [user_id] if user_id else _get_all_user_ids()
+
+    results: List[Dict[str, Any]] = []
+    evolved = 0
+    skipped = 0
+    errors = 0
+
+    for uid in user_ids:
+        if not uid:
+            continue
+        try:
+            result = evaluate_and_evolve_plan(uid)
+            results.append(result)
+            if result.get("status") == "evolved":
+                evolved += 1
+            else:
+                skipped += 1
+        except Exception as exc:
+            errors += 1
+            results.append(
+                {
+                    "ok": False,
+                    "status": "error",
+                    "user_id": uid,
+                    "error": str(exc),
+                }
+            )
+
+    return {
+        "ok": errors == 0,
+        "users_processed": len(user_ids),
+        "evolved": evolved,
+        "skipped": skipped,
+        "errors": errors,
+        "results": results,
+    }
 
 
 def _fetch_latest_plan(user_id: str, collection_name: str) -> Dict[str, Any]:
