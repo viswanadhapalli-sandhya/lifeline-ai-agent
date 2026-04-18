@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { onAuthStateChanged } from "firebase/auth";
-import { collection, getDocs, limit, onSnapshot, orderBy, query } from "firebase/firestore";
+import { collection, doc, getDocs, limit, onSnapshot, orderBy, query } from "firebase/firestore";
 import { auth, db } from "../services/firebase";
 import TopNav from "../components/TopNav";
 import { postJSON } from "../services/api";
@@ -89,6 +89,7 @@ export default function Coach() {
   const [mode, setMode] = useState("auto");
   const [autonomous, setAutonomous] = useState(false);
   const [showTrace, setShowTrace] = useState(false);
+  const [liveProgressSummary, setLiveProgressSummary] = useState(null);
 
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, async (user) => {
@@ -119,6 +120,39 @@ export default function Coach() {
     });
 
     return () => unsub();
+  }, []);
+
+  useEffect(() => {
+    let unsubProgress = () => {};
+
+    const unsubAuth = onAuthStateChanged(auth, (user) => {
+      unsubProgress();
+
+      if (!user) {
+        setLiveProgressSummary(null);
+        return;
+      }
+
+      const summaryRef = doc(db, "users", user.uid, "progressStats", "summary");
+      unsubProgress = onSnapshot(
+        summaryRef,
+        (snap) => {
+          if (!snap.exists()) {
+            setLiveProgressSummary(null);
+            return;
+          }
+          setLiveProgressSummary(snap.data() || null);
+        },
+        () => {
+          setLiveProgressSummary(null);
+        }
+      );
+    });
+
+    return () => {
+      unsubProgress();
+      unsubAuth();
+    };
   }, []);
 
   useEffect(() => {
@@ -268,7 +302,12 @@ export default function Coach() {
     return null;
   })();
 
-  const progressWorkoutDays = Number(latestProgressSummary?.total_workout_days || 0);
+  const resolvedProgressSummary =
+    liveProgressSummary && Object.keys(liveProgressSummary).length > 0
+      ? liveProgressSummary
+      : latestProgressSummary;
+
+  const progressWorkoutDays = Number(resolvedProgressSummary?.total_workout_days || 0);
   const currentCycleWeek = Math.floor(progressWorkoutDays / 7) + 1;
   const currentCycleDay = (progressWorkoutDays % 7) + 1;
 
@@ -359,7 +398,7 @@ export default function Coach() {
           </div>
         </div>
 
-        {latestProgressSummary && (
+        {resolvedProgressSummary && (
           <div className="mb-4 p-3 rounded-xl border border-zinc-700 bg-zinc-900/70 space-y-2">
             <div className="text-sm font-semibold text-zinc-200">Progress Summary</div>
             <div className="grid grid-cols-2 md:grid-cols-5 gap-2 text-xs">
@@ -369,27 +408,27 @@ export default function Coach() {
               </div>
               <div className="rounded-md border border-zinc-700 bg-zinc-800/60 p-2">
                 <div className="text-zinc-400">Workout Days</div>
-                <div className="text-zinc-100 font-semibold">{latestProgressSummary.total_workout_days || 0}</div>
+                <div className="text-zinc-100 font-semibold">{resolvedProgressSummary.total_workout_days || 0}</div>
               </div>
               <div className="rounded-md border border-zinc-700 bg-zinc-800/60 p-2">
                 <div className="text-zinc-400">Meal-log Days</div>
-                <div className="text-zinc-100 font-semibold">{latestProgressSummary.total_meal_log_days || 0}</div>
+                <div className="text-zinc-100 font-semibold">{resolvedProgressSummary.total_meal_log_days || 0}</div>
               </div>
               <div className="rounded-md border border-zinc-700 bg-zinc-800/60 p-2">
                 <div className="text-zinc-400">Total Logs</div>
-                <div className="text-zinc-100 font-semibold">{latestProgressSummary.total_daily_logs || 0}</div>
+                <div className="text-zinc-100 font-semibold">{resolvedProgressSummary.total_daily_logs || 0}</div>
               </div>
               <div className="rounded-md border border-zinc-700 bg-zinc-800/60 p-2">
                 <div className="text-zinc-400">Workout Minutes</div>
-                <div className="text-zinc-100 font-semibold">{latestProgressSummary.total_workout_minutes || 0}</div>
+                <div className="text-zinc-100 font-semibold">{resolvedProgressSummary.total_workout_minutes || 0}</div>
               </div>
             </div>
 
-            {Array.isArray(latestProgressSummary.recent_workout_history) &&
-              latestProgressSummary.recent_workout_history.length > 0 && (
+            {Array.isArray(resolvedProgressSummary.recent_workout_history) &&
+              resolvedProgressSummary.recent_workout_history.length > 0 && (
                 <div className="text-xs text-zinc-300 rounded-md border border-zinc-700 bg-zinc-800/40 p-2">
                   <div className="font-semibold text-zinc-200 mb-1">Recent Workout History</div>
-                  {latestProgressSummary.recent_workout_history.slice(0, 5).map((entry, idx) => (
+                  {resolvedProgressSummary.recent_workout_history.slice(0, 5).map((entry, idx) => (
                     <div key={`${entry.date || "unknown"}-${idx}`}>
                       {(entry.date || "unknown")}: {entry.workout_minutes || 0} min
                     </div>

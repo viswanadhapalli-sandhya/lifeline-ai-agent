@@ -414,7 +414,19 @@ def _extract_structured_logs(message: str) -> Dict[str, Any]:
     if workout_match:
         extracted["workout_minutes"] = int(workout_match.group(1))
 
-    if any(token in lowered for token in ["ate", "breakfast", "lunch", "dinner", "snack"]):
+    meal_tokens = [
+        "ate",
+        "had",
+        "eaten",
+        "meal",
+        "breakfast",
+        "lunch",
+        "dinner",
+        "snack",
+        "diet",
+        "food",
+    ]
+    if any(token in lowered for token in meal_tokens):
         extracted["meal_text"] = text
         extracted["meal_logged"] = True
 
@@ -438,16 +450,19 @@ def _extract_structured_logs(message: str) -> Dict[str, Any]:
     if completion_day_match:
         extracted["workout_completed"] = True
         extracted["workout_day_number"] = int(completion_day_match.group(1))
+        extracted["meal_logged"] = True
 
     completion_day_match_alt = re.search(r"\bday\s*(\d{1,2})\s*(?:done|completed|finished)\b", lowered)
     if completion_day_match_alt:
         extracted["workout_completed"] = True
         extracted["workout_day_number"] = int(completion_day_match_alt.group(1))
+        extracted["meal_logged"] = True
 
     completion_day_match_over = re.search(r"\bday\s*(\d{1,2})\s*(?:is\s+)?over\b", lowered)
     if completion_day_match_over:
         extracted["workout_completed"] = True
         extracted["workout_day_number"] = int(completion_day_match_over.group(1))
+        extracted["meal_logged"] = True
 
     if (
         not bool(extracted.get("travel_window_closed", False))
@@ -794,6 +809,24 @@ def _extract_structured_logs_with_ai(message: str) -> Dict[str, Any]:
     if not text:
         return {}
 
+    def _looks_like_meal_log(raw_text: str) -> bool:
+        lowered_text = (raw_text or "").lower()
+        if not lowered_text:
+            return False
+        meal_hints = [
+            "ate",
+            "had",
+            "eaten",
+            "meal",
+            "breakfast",
+            "lunch",
+            "dinner",
+            "snack",
+            "diet",
+            "food",
+        ]
+        return any(token in lowered_text for token in meal_hints)
+
     prompt = f"""
 You are a fitness log parser.
 Extract structured daily log fields from the user message.
@@ -868,6 +901,13 @@ Return STRICT JSON only:
         compensation_request = payload.get("compensation_request")
         if isinstance(compensation_request, bool):
             cleaned["compensation_request"] = compensation_request
+
+        # Deterministic fallback: if message clearly contains meal-log cues,
+        # persist meal data even when model extraction is incomplete.
+        if _looks_like_meal_log(text):
+            if not isinstance(cleaned.get("meal_text"), str) or not cleaned.get("meal_text", "").strip():
+                cleaned["meal_text"] = text
+            cleaned["meal_logged"] = True
 
         if cleaned:
             return cleaned
@@ -1974,6 +2014,11 @@ def run_agent(request: AgentRequest) -> AgentResponse:
     # Guardrail: if user asks for today's plan, do not route to progress summary.
     if today_plan_query:
         log_summary_query = False
+
+    if log_summary_query:
+        all_logs = _fetch_all_daily_logs(request.user_id)
+        progress_summary = _refresh_progress_summary(request.user_id, logs=all_logs)
+        actions.append("progress_summary_refreshed_for_query")
 
     travel_disruption = bool(llm_brain.get("travel_disruption", False)) or bool(structured_logs.get("travel_disruption", False))
     compensation_requested = bool(llm_brain.get("compensation_requested", False)) or bool(structured_logs.get("compensation_request", False))
