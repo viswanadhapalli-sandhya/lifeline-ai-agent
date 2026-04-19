@@ -1,21 +1,85 @@
-# dependencies
-node_modules/
+# -----------------------------
+# OS / Editor
+# -----------------------------
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
 
-# env files
+# -----------------------------
+# Root / Shared
+# -----------------------------
 .env
-.env.local
+.env.*
+!.env.example
+*.log
+coverage/
 
-# vite cache
-.vite/
-
-# build output
-dist/
-
-# logs
-npm-debug.log*
-
-serviceAccountKey.json
-backend/app/serviceAccountKey.json
-.env
+# Python virtual environments (root and nested)
+.venv/
 venv/
+env/
+
+# -----------------------------
+# Backend (Python)
+# -----------------------------
+backend/.env
+backend/.env.*
+!backend/.env.example
+
+backend/.venv/
+backend/venv/
+
+backend/__pycache__/
+backend/**/*.py[cod]
+backend/**/*.pyo
+backend/**/*.pyd
+backend/.pytest_cache/
+backend/.mypy_cache/
+backend/.ruff_cache/
+backend/.coverage
+backend/htmlcov/
+
+# Build/distribution artifacts
+backend/build/
+backend/dist/
+backend/*.egg-info/
+
+# Python/Jupyter checkpoints
+backend/.ipynb_checkpoints/
+
+# Sensitive backend keys
+backend/app/serviceAccountKey.json
+backend/app/core/serviceAccountKey.json
+backend/**/serviceAccountKey.json
+
+# -----------------------------
+# Frontend (Vite / Node)
+# -----------------------------
+frontend/.env
+frontend/.env.*
+!frontend/.env.example
+
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/.cache/
+
+# JS package manager/debug logs
+frontend/npm-debug.log*
+frontend/yarn-debug.log*
+frontend/yarn-error.log*
+frontend/pnpm-debug.log*
+
+# -----------------------------
+# Generic Node (safety)
+# -----------------------------
 node_modules/
+dist/
+.vite/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
