@@ -50,9 +50,11 @@ export default function TopNav({ rightText = "Logout", onRightClick }) {
 
         <div className="flex items-center gap-2">
           {navItem("/dashboard", "Dashboard")}
+          {navItem("/form", "Update Form")}
           {navItem("/workouts", "Workouts")}
           {navItem("/nutrition", "Nutrition")}
           {navItem("/coach", "AI Coach")}
+          {navItem("/suggestions", "Suggestions")}
           {navItem("/insights", "Insights")}
 
           <button

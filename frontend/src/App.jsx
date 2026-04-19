@@ -8,6 +8,7 @@ import Workouts from "./pages/Workouts";
 import Nutrition from "./pages/Nutrition";
 import AICoach from "./pages/Coach";
 import Insights from "./pages/Insights";
+import Suggestions from "./pages/Suggestions";
 
 export default function App() {
   return (
@@ -23,6 +24,7 @@ export default function App() {
         <Route path="/workouts" element={<Workouts />} />
         <Route path="/nutrition" element={<Nutrition />} />
         <Route path="/coach" element={<AICoach />} />
+        <Route path="/suggestions" element={<Suggestions />} />
         <Route path="/insights" element={<Insights />} />
       </Routes>
     </BrowserRouter>

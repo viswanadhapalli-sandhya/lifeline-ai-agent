@@ -1,6 +1,18 @@
 import { useEffect, useState } from "react";
 import { onAuthStateChanged } from "firebase/auth";
-import { collection, doc, getDocs, limit, onSnapshot, orderBy, query } from "firebase/firestore";
+import {
+  collection,
+  deleteDoc,
+  doc,
+  getDocs,
+  limit,
+  onSnapshot,
+  orderBy,
+  query,
+  serverTimestamp,
+  updateDoc,
+  writeBatch,
+} from "firebase/firestore";
 import { auth, db } from "../services/firebase";
 import TopNav from "../components/TopNav";
 import { postJSON } from "../services/api";
@@ -93,7 +105,10 @@ export default function Coach() {
   const [proactiveLoading, setProactiveLoading] = useState(false);
   const [proactiveData, setProactiveData] = useState(null);
   const [hasAutoProactiveRun, setHasAutoProactiveRun] = useState(false);
-  const [coachSuggestions, setCoachSuggestions] = useState([]);
+  const [menuConversationId, setMenuConversationId] = useState(null);
+  const [renameConversationId, setRenameConversationId] = useState(null);
+  const [renameInput, setRenameInput] = useState("");
+  const [actionConversationId, setActionConversationId] = useState(null);
 
   const loadingMessage = proactiveLoading
     ? "Analyzing your habits..."
@@ -101,23 +116,93 @@ export default function Coach() {
       ? "Adjusting your plan..."
       : "";
 
-  const formatSuggestionTime = (createdAt) => {
-    if (!createdAt) return "";
-    try {
-      if (typeof createdAt?.toDate === "function") {
-        return createdAt.toDate().toLocaleString();
-      }
-      if (createdAt instanceof Date) {
-        return createdAt.toLocaleString();
-      }
-    } catch {
-      return "";
+  const conversationTitle = (conversation) => {
+    const raw = String(conversation?.title || "").trim();
+    return raw || "New chat";
+  };
+
+  const startRenameConversation = (conversation) => {
+    setMenuConversationId(null);
+    setRenameConversationId(conversation.id);
+    setRenameInput(conversationTitle(conversation));
+  };
+
+  const cancelRenameConversation = () => {
+    setRenameConversationId(null);
+    setRenameInput("");
+  };
+
+  const submitRenameConversation = async (conversationId) => {
+    const user = auth.currentUser;
+    if (!user || !conversationId) return;
+
+    const nextTitle = renameInput.trim().slice(0, 60);
+    if (!nextTitle) {
+      alert("Chat title cannot be empty");
+      return;
     }
-    return "";
+
+    setActionConversationId(conversationId);
+    try {
+      await updateDoc(doc(db, "users", user.uid, "conversations", conversationId), {
+        title: nextTitle,
+        updatedAt: serverTimestamp(),
+      });
+      cancelRenameConversation();
+    } catch (e) {
+      alert(e?.message || "Failed to rename chat");
+    } finally {
+      setActionConversationId(null);
+    }
+  };
+
+  const deleteConversation = async (conversationId) => {
+    const user = auth.currentUser;
+    if (!user || !conversationId) return;
+
+    const confirmed = window.confirm("Delete this chat and all its messages?");
+    if (!confirmed) return;
+
+    setMenuConversationId(null);
+    setActionConversationId(conversationId);
+    try {
+      const messagesRef = collection(db, "users", user.uid, "conversations", conversationId, "messages");
+      const messagesSnap = await getDocs(messagesRef);
+
+      let batch = writeBatch(db);
+      let ops = 0;
+      for (const messageDoc of messagesSnap.docs) {
+        batch.delete(messageDoc.ref);
+        ops += 1;
+        if (ops === 400) {
+          await batch.commit();
+          batch = writeBatch(db);
+          ops = 0;
+        }
+      }
+      if (ops > 0) {
+        await batch.commit();
+      }
+
+      await deleteDoc(doc(db, "users", user.uid, "conversations", conversationId));
+
+      if (activeConversationId === conversationId) {
+        setActiveConversationId(null);
+        setMessages([]);
+      }
+    } catch (e) {
+      alert(e?.message || "Failed to delete chat");
+    } finally {
+      setActionConversationId(null);
+    }
   };
 
   useEffect(() => {
-    const unsub = onAuthStateChanged(auth, async (user) => {
+    let unsubConversations = () => {};
+
+    const unsub = onAuthStateChanged(auth, (user) => {
+      unsubConversations();
+
       if (!user) {
         setMessages([]);
         setConversations([]);
@@ -125,78 +210,49 @@ export default function Coach() {
         return;
       }
 
-      try {
-        const convQ = query(
-          collection(db, "users", user.uid, "conversations"),
-          orderBy("updatedAt", "desc"),
-          limit(50)
-        );
-
-        const convSnap = await getDocs(convQ);
-        const convs = convSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
-        setConversations(convs);
-
-        if (convs.length > 0) {
-          setActiveConversationId((prev) => prev || convs[0].id);
-        }
-      } catch (e) {
-        console.error("Failed to load coach history", e);
-      }
-    });
-
-    return () => unsub();
-  }, []);
-
-  useEffect(() => {
-    let unsubSuggestions = () => {};
-
-    const unsubAuth = onAuthStateChanged(auth, (user) => {
-      unsubSuggestions();
-
-      if (!user) {
-        setCoachSuggestions([]);
-        return;
-      }
-
-      const proactiveEventsQ = query(
-        collection(db, "users", user.uid, "agentEvents"),
-        orderBy("createdAt", "desc"),
-        limit(30)
+      const convQ = query(
+        collection(db, "users", user.uid, "conversations"),
+        orderBy("updatedAt", "desc"),
+        limit(50)
       );
 
-      unsubSuggestions = onSnapshot(
-        proactiveEventsQ,
-        (snap) => {
-          const suggestions = snap.docs
-            .map((d) => ({ id: d.id, ...(d.data() || {}) }))
-            .filter((event) => {
-              const eventType = String(event.type || "").toLowerCase();
-              return eventType === "proactive" || eventType === "proactive_suggestion";
-            })
-            .slice(0, 6)
-            .map((event) => ({
-              id: event.id,
-              action: String(event.action || "general_coaching"),
-              priority: String(event.priority || "medium").toLowerCase(),
-              message: String(event.message || "").trim(),
-              why: String(event.why_this_action || event.reason || "").trim(),
-              confidence: Number(event.confidence || event?.decision?.confidence || 0),
-              createdAt: event.createdAt || null,
-            }));
+      unsubConversations = onSnapshot(
+        convQ,
+        (convSnap) => {
+          const convs = convSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
+          setConversations(convs);
 
-          setCoachSuggestions(suggestions);
+          setActiveConversationId((prev) => {
+            if (prev && convs.some((c) => c.id === prev)) return prev;
+            return convs[0]?.id || null;
+          });
         },
-        () => {
-          setCoachSuggestions([]);
+        (e) => {
+          console.error("Failed to load coach history", e);
+          setConversations([]);
         }
       );
     });
 
     return () => {
-      unsubSuggestions();
-      unsubAuth();
+      unsubConversations();
+      unsub();
     };
   }, []);
+
+  useEffect(() => {
+    if (!menuConversationId) return;
+
+    const onDocumentClick = (event) => {
+      const target = event.target;
+      if (!(target instanceof Element)) return;
+      if (target.closest("[data-conversation-actions='true']")) return;
+      setMenuConversationId(null);
+    };
+
+    document.addEventListener("click", onDocumentClick);
+    return () => document.removeEventListener("click", onDocumentClick);
+  }, [menuConversationId]);
 
   useEffect(() => {
     let unsubProgress = () => {};
@@ -417,9 +473,9 @@ export default function Coach() {
     <div className="min-h-screen bg-black text-white">
       <TopNav />
 
-      <div className="max-w-6xl mx-auto p-4 grid md:grid-cols-[280px_1fr] gap-4">
-        <div className="border border-zinc-800 rounded-xl bg-zinc-950 p-3 h-[85vh] overflow-auto">
-          <div className="flex items-center justify-between mb-3">
+      <div className="max-w-6xl mx-auto p-4 grid md:grid-cols-[280px_1fr] gap-4 items-start">
+        <div className="sticky top-24 border border-zinc-800 rounded-xl bg-zinc-950 p-3 h-[calc(100vh-7rem)] flex flex-col self-start">
+          <div className="flex items-center justify-between mb-3 shrink-0">
             <div className="text-sm font-semibold text-zinc-300">Chats</div>
             <button
               onClick={() => {
@@ -432,19 +488,95 @@ export default function Coach() {
             </button>
           </div>
 
-          <div className="space-y-2">
+          <div className="space-y-2 overflow-y-auto pr-1">
             {conversations.map((c) => (
-              <button
+              <div
                 key={c.id}
-                onClick={() => setActiveConversationId(c.id)}
-                className={`w-full text-left px-3 py-2 rounded-md border text-sm ${
+                className={`group relative rounded-md border ${
                   activeConversationId === c.id
                     ? "bg-zinc-800 border-zinc-600"
-                    : "bg-zinc-900 border-zinc-800 hover:bg-zinc-800"
+                    : "bg-zinc-900 border-zinc-800"
                 }`}
               >
-                {(c.title || "New chat").toString()}
-              </button>
+                {renameConversationId === c.id ? (
+                  <div className="p-2 space-y-2" data-conversation-actions="true">
+                    <input
+                      autoFocus
+                      value={renameInput}
+                      onChange={(e) => setRenameInput(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          e.preventDefault();
+                          void submitRenameConversation(c.id);
+                        }
+                        if (e.key === "Escape") {
+                          e.preventDefault();
+                          cancelRenameConversation();
+                        }
+                      }}
+                      className="w-full rounded-md bg-zinc-900 border border-zinc-700 px-2 py-1 text-sm"
+                    />
+                    <div className="flex gap-2">
+                      <button
+                        onClick={() => submitRenameConversation(c.id)}
+                        disabled={actionConversationId === c.id}
+                        className="px-2 py-1 text-xs rounded-md bg-zinc-700 hover:bg-zinc-600 disabled:opacity-60"
+                      >
+                        Save
+                      </button>
+                      <button
+                        onClick={cancelRenameConversation}
+                        disabled={actionConversationId === c.id}
+                        className="px-2 py-1 text-xs rounded-md bg-zinc-800 border border-zinc-700 hover:bg-zinc-700 disabled:opacity-60"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-1">
+                    <button
+                      onClick={() => setActiveConversationId(c.id)}
+                      className={`flex-1 text-left px-3 py-2 text-sm truncate ${
+                        activeConversationId === c.id ? "" : "hover:bg-zinc-800"
+                      }`}
+                    >
+                      {conversationTitle(c)}
+                    </button>
+
+                    <div className="relative pr-1" data-conversation-actions="true">
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setMenuConversationId((prev) => (prev === c.id ? null : c.id));
+                        }}
+                        className="px-2 py-1 rounded-md text-zinc-300 hover:bg-zinc-700 opacity-100 md:opacity-0 md:group-hover:opacity-100 transition-opacity"
+                        aria-label="Chat actions"
+                      >
+                        ...
+                      </button>
+
+                      {menuConversationId === c.id && (
+                        <div className="absolute right-1 top-9 z-10 w-32 rounded-md border border-zinc-700 bg-zinc-900 shadow-lg overflow-hidden">
+                          <button
+                            onClick={() => startRenameConversation(c)}
+                            className="w-full px-3 py-2 text-left text-xs hover:bg-zinc-800"
+                          >
+                            Rename
+                          </button>
+                          <button
+                            onClick={() => deleteConversation(c.id)}
+                            disabled={actionConversationId === c.id}
+                            className="w-full px-3 py-2 text-left text-xs text-rose-300 hover:bg-zinc-800 disabled:opacity-60"
+                          >
+                            Delete
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
             ))}
           </div>
         </div>
@@ -570,46 +702,6 @@ export default function Coach() {
             )}
           </div>
         )}
-
-        <div className="mb-4 p-3 rounded-xl border border-cyan-700/40 bg-cyan-950/20 space-y-3">
-          <div className="text-sm font-semibold text-cyan-200">Coach Suggestions</div>
-
-          {coachSuggestions.length === 0 ? (
-            <div className="text-xs text-cyan-100/70">
-              No proactive suggestions yet. The autonomous coach loop will populate this as new interventions are generated.
-            </div>
-          ) : (
-            <div className="space-y-2">
-              {coachSuggestions.map((item) => {
-                const isHigh = item.priority === "high";
-                const toneClass = isHigh
-                  ? "border-rose-400/60 bg-rose-500/10"
-                  : "border-cyan-700/30 bg-black/20";
-
-                return (
-                  <div key={item.id} className={`rounded-md border p-2 text-xs space-y-1 ${toneClass}`}>
-                    <div className="flex items-center justify-between gap-2">
-                      <div className="font-semibold text-cyan-100">{item.action.replaceAll("_", " ")}</div>
-                      <div className={`uppercase tracking-wide ${isHigh ? "text-rose-200" : "text-cyan-200/90"}`}>
-                        {item.priority}
-                      </div>
-                    </div>
-
-                    {item.message && <div className="text-cyan-100/95">{item.message}</div>}
-                    {item.why && <div className="text-cyan-200/80">Why this action: {item.why}</div>}
-                    {item.confidence > 0 && (
-                      <div className="text-cyan-300/90">Confidence: {(item.confidence * 100).toFixed(0)}%</div>
-                    )}
-
-                    <div className="text-[10px] text-cyan-100/60">
-                      {formatSuggestionTime(item.createdAt) || "Just now"}
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          )}
-        </div>
 
         {resolvedProgressSummary && (
           <div className="mb-4 p-3 rounded-xl border border-zinc-700 bg-zinc-900/70 space-y-2">

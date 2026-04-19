@@ -16,7 +16,6 @@ export default function Nutrition() {
   const [providerSelection, setProviderSelection] = useState({
     blinkit: true,
     zepto: true,
-    swiggy_instamart: true,
     amazon: false,
     bigbasket: false,
   });
@@ -172,6 +171,14 @@ export default function Nutrition() {
       .map((x) => x.trim())
       .filter(Boolean);
 
+  const blockedProviderKeys = new Set(["swiggy_instamart", "instamart"]);
+  const normalizeProviderKey = (value) =>
+    String(value || "")
+      .toLowerCase()
+      .trim()
+      .replaceAll(" ", "_");
+  const isProviderAllowed = (providerName) => !blockedProviderKeys.has(normalizeProviderKey(providerName));
+
   const selectedProviders = Object.entries(providerSelection)
     .filter(([, enabled]) => enabled)
     .map(([provider]) => provider);
@@ -188,9 +195,12 @@ export default function Nutrition() {
   const missingIngredients = Array.isArray(shoppingPlan?.missing_ingredients)
     ? shoppingPlan.missing_ingredients.filter(Boolean)
     : [];
-  const bestProvider = shoppingPlan?.best_provider || null;
+  const bestProvider =
+    shoppingPlan?.best_provider && isProviderAllowed(shoppingPlan.best_provider.name)
+      ? shoppingPlan.best_provider
+      : null;
   const alternatives = Array.isArray(shoppingPlan?.alternatives)
-    ? shoppingPlan.alternatives.filter((x) => x && x.name)
+    ? shoppingPlan.alternatives.filter((x) => x && x.name && isProviderAllowed(x.name))
     : [];
   const selectionReason = String(shoppingPlan?.reason || "").trim();
   const detectedBudget =
@@ -293,9 +303,6 @@ export default function Nutrition() {
         return `https://www.zeptonow.com/search?q=${query}`;
       case "blinkit":
         return `https://blinkit.com/s/?q=${query}`;
-      case "instamart":
-      case "swiggy_instamart":
-        return `https://www.swiggy.com/instamart/search?query=${query}`;
       case "bigbasket":
         return `https://www.bigbasket.com/ps/?q=${query}`;
       case "amazon":
@@ -376,10 +383,12 @@ export default function Nutrition() {
   };
 
   return (
-    <div className="min-h-screen bg-black text-white p-6">
+    <div className="min-h-screen bg-black text-white">
       <TopNav />
 
-      <h1 className="text-2xl font-bold mb-6">Your Nutrition Plan 🥗</h1>
+      <div className="max-w-6xl mx-auto p-4 space-y-4">
+
+      <h1 className="text-2xl font-bold">Your Nutrition Plan 🥗</h1>
 
       {proactiveSuggestion?.items?.length > 0 && (
         <div className="mb-4 rounded-lg border border-amber-400/40 bg-amber-900/20 px-4 py-3 text-sm text-amber-100">
@@ -417,7 +426,7 @@ export default function Nutrition() {
         </div>
       )}
 
-      <div className="mb-6 rounded-xl border border-white/15 bg-white/5 p-4 space-y-4">
+      <div className="rounded-xl border border-zinc-700 bg-zinc-900/60 p-4 space-y-4">
         <div>
           <h2 className="text-lg font-semibold">Nutrition Shopping Agent</h2>
           <p className="text-sm text-gray-300 mt-1">
@@ -436,7 +445,6 @@ export default function Nutrition() {
             />
           </div>
           <div>
-            <label className="text-xs text-gray-300">Unavailable items (comma separated)</label>
             <textarea
               value={unavailableInput}
               onChange={(e) => setUnavailableInput(e.target.value)}
@@ -472,9 +480,7 @@ export default function Nutrition() {
           <div className="flex flex-wrap gap-3">
             {[
               ["blinkit", "Blinkit"],
-              ["zepto", "Zepto"],
-              ["swiggy_instamart", "Swiggy Instamart"],
-              ["amazon", "Amazon"],
+              ["zepto", "Zepto"],              ["amazon", "Amazon"],
               ["bigbasket", "BigBasket"],
             ].map(([key, label]) => (
               <label key={key} className="text-sm flex items-center gap-2">
@@ -771,10 +777,10 @@ export default function Nutrition() {
         )}
       </div>
 
-      <div className="grid md:grid-cols-2 gap-6">
+      <div className="grid md:grid-cols-2 gap-4">
         {visiblePlanDays.length > 0 ? (
           visiblePlanDays.map((day, i) => (
-            <div key={`${day?.day || "day"}-${i}`} className="border border-white/10 rounded-xl p-5">
+            <div key={`${day?.day || "day"}-${i}`} className="border border-zinc-700 bg-zinc-900/60 rounded-xl p-5">
               <h2 className="font-bold">{day.day}</h2>
 
               <Section title="Breakfast" items={day.breakfast} />
@@ -786,13 +792,14 @@ export default function Nutrition() {
             </div>
           ))
         ) : (
-          <div className="md:col-span-2 border border-white/10 rounded-xl p-5 bg-white/5">
+          <div className="md:col-span-2 border border-zinc-700 rounded-xl p-5 bg-zinc-900/60">
             <h2 className="font-bold">No pending nutrition days in this cycle</h2>
             <p className="text-sm text-gray-300 mt-2">
               Great consistency. Ask Coach to refresh your next cycle nutrition plan.
             </p>
           </div>
         )}
+      </div>
       </div>
     </div>
   );

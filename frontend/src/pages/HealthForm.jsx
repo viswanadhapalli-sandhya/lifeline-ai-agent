@@ -2,6 +2,7 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { postJSON } from "../services/api";
+import TopNav from "../components/TopNav";
 
 import { auth, db } from "../services/firebase";
 import { addDoc, collection, serverTimestamp } from "firebase/firestore";
@@ -126,11 +127,14 @@ navigate("/coach");
   };
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-black via-zinc-900 to-green-950 flex items-center justify-center p-6">
-      <form
-        onSubmit={handleSubmit}
-        className="bg-zinc-900/90 backdrop-blur-lg border border-green-600/30 text-white w-full max-w-4xl rounded-3xl shadow-2xl p-10 space-y-10"
-      >
+    <div className="min-h-screen bg-gradient-to-br from-black via-zinc-900 to-green-950 text-white">
+      <TopNav />
+
+      <div className="p-6 flex items-center justify-center">
+        <form
+          onSubmit={handleSubmit}
+          className="bg-zinc-900/90 backdrop-blur-lg border border-green-600/30 text-white w-full max-w-4xl rounded-3xl shadow-2xl p-10 space-y-10"
+        >
         <div className="text-center">
           <h1 className="text-3xl font-bold text-green-400">Lifeline AI</h1>
           <p className="text-gray-400">Prevent Disease Before Diagnosis</p>
@@ -210,7 +214,8 @@ navigate("/coach");
         >
           {loading ? "Analyzing..." : "Risk Analysis"}
         </button>
-      </form>
+        </form>
+      </div>
     </div>
   );
 }

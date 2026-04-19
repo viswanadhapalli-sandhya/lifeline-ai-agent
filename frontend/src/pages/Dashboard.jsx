@@ -12,6 +12,7 @@ import {
   query,
   limit,
 } from "firebase/firestore";
+import TopNav from "../components/TopNav";
 
 
 export default function Dashboard() {
@@ -148,36 +149,10 @@ export default function Dashboard() {
 
   // ✅ This guarantees something visible always
   return (
-    <div className="min-h-screen bg-gradient-to-br from-black via-zinc-900 to-green-950 text-white p-6">
-      <div className="max-w-5xl mx-auto space-y-6">
+    <div className="min-h-screen bg-gradient-to-br from-black via-zinc-900 to-green-950 text-white">
+      <TopNav />
 
-        {/* TOP BAR */}
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-xl bg-green-500/20 border border-green-500/30 flex items-center justify-center font-bold text-green-300">
-              LA
-            </div>
-            <div>
-              <div className="text-xl font-bold">LifeLine AI</div>
-              <div className="text-sm text-gray-400">Dashboard</div>
-            </div>
-          </div>
-
-          <div className="flex gap-3">
-            <button
-              onClick={() => navigate("/form")}
-              className="px-4 py-2 rounded-lg bg-green-500 text-black font-semibold hover:bg-green-600"
-            >
-              Update Form
-            </button>
-            <button
-              onClick={() => navigate("/")}
-              className="px-4 py-2 rounded-lg bg-zinc-800 border border-zinc-700 hover:bg-zinc-700"
-            >
-              Home
-            </button>
-          </div>
-        </div>
+      <div className="max-w-5xl mx-auto p-6 space-y-6">
 
         {/* DEBUG CARD (TEMP — don’t delete yet) */}
         <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
