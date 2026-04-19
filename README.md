@@ -138,7 +138,7 @@ Frontend pages consume these events for transparent decision timelines and coach
 ## 1) Clone and open
 
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/viswanadhapalli-sandhya/lifeline-ai-agent.git
 cd lifeline-ai-agentic
 ```
 
@@ -158,7 +158,95 @@ GROQ_API_KEY=your_groq_api_key
 MODEL_NAME=llama-3.1-8b-instant
 ```
 
-Ensure Firebase service account credentials are configured for the backend Firebase client.
+## Firebase Setup (Required)
+
+### A) Create Firebase project
+
+1. Open Firebase Console and create/select a project.
+2. Enable Authentication -> Sign-in method -> Google.
+3. Enable Firestore Database (start in test mode for local development, then lock with rules for production).
+
+### B) Frontend Firebase config
+
+Create `frontend/.env` and set:
+
+```env
+VITE_FIREBASE_API_KEY=your_api_key
+VITE_FIREBASE_AUTH_DOMAIN=your_project.firebaseapp.com
+VITE_FIREBASE_PROJECT_ID=your_project_id
+VITE_FIREBASE_STORAGE_BUCKET=your_project.appspot.com
+VITE_FIREBASE_MESSAGING_SENDER_ID=your_sender_id
+VITE_FIREBASE_APP_ID=your_app_id
+```
+
+These values are consumed by `frontend/src/services/firebase.js`.
+
+### C) Backend Firebase service account
+
+1. In Firebase Console -> Project Settings -> Service accounts -> Generate new private key.
+2. Download the JSON key file.
+3. Place it at `backend/app/core/serviceAccountKey.json`.
+
+The backend reads this exact path in `backend/app/core/firebase_client.py`.
+
+### D) Firestore data paths used by this app
+
+Main collections/subcollections per user:
+
+- `users/{uid}/healthRecords`
+- `users/{uid}/workoutPlans`
+- `users/{uid}/nutritionPlans`
+- `users/{uid}/dailyLogs`
+- `users/{uid}/progressStats/summary`
+- `users/{uid}/conversations`
+- `users/{uid}/agentEvents`
+- `users/{uid}/pantry/current`
+- `users/{uid}/nutritionShoppingPlans`
+
+For local testing, ensure authenticated users can read/write these paths.
+
+### E) Firestore Security Rules
+
+Use these rules in Firebase Console -> Firestore Database -> Rules.
+
+Development rules (quick local testing):
+
+```rules
+rules_version = '2';
+service cloud.firestore {
+	match /databases/{database}/documents {
+		// WARNING: development-only rule.
+		match /{document=**} {
+			allow read, write: if request.auth != null;
+		}
+	}
+}
+```
+
+Production starter rules (recommended):
+
+```rules
+rules_version = '2';
+service cloud.firestore {
+	match /databases/{database}/documents {
+		// User can access only their own document tree.
+		match /users/{userId}/{document=**} {
+			allow read, write: if request.auth != null && request.auth.uid == userId;
+		}
+
+		// Deny everything else by default.
+		match /{document=**} {
+			allow read, write: if false;
+		}
+	}
+}
+```
+
+Notes:
+
+- Start with development rules only while wiring local features.
+- Switch to production rules before deployment.
+- If needed, tighten specific subcollections later with additional validations.
 
 Start backend:
 
